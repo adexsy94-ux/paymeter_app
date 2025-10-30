@@ -1,12 +1,9 @@
 # paymeter_app.py
 # -*- coding: utf-8 -*-
 """
-Paymeter + Eko Streamlit app (consolidated, Excel sheets updated)
-- repairs address spills in paymeter_report.csv
-- merges district lookup
-- merges with Eko Trans.csv, normalizes amounts
-- robust KCG detection and reporting
-- exports CSV and Excel workbook (with user-requested sheets)
+Paymeter Pro – Fancy UI + Clear Instructions + Custom Logo
+All reports → ONE timestamped Excel
+Run: streamlit run paymeter_app.py
 """
 
 import csv
@@ -14,8 +11,10 @@ import re
 import os
 import shutil
 import tempfile
+import base64  # For logo encoding
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -28,9 +27,10 @@ DATA_DIR = BASE_DIR / "data"
 DEFAULT_DISTRICT = DATA_DIR / "district.csv"
 DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
+LOGO_PATH = DATA_DIR / "Logo.png"
 
 # -----------------------------
-# Utility helpers
+# Utility helpers (unchanged)
 # -----------------------------
 _amount_re = re.compile(r"""^\s*[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*$""")
 
@@ -85,16 +85,6 @@ def pick_kcg_column(df: pd.DataFrame) -> str:
             return c
     return cols[0]
 
-def coerce_amount_column(df: pd.DataFrame, col: str) -> None:
-    if col not in df.columns:
-        return
-    df[col] = (
-        df[col].astype(str)
-        .str.replace(r"[,\s₦$]", "", regex=True)
-        .replace({"nan": None, "None": None})
-    )
-    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
 # -----------------------------
 # Step A: Repair address spill
 # -----------------------------
@@ -123,9 +113,9 @@ def repair_address_spill(
     addr_idx = find_col_index(header, address_candidates)
     txn_idx = find_col_index(header, txn_amt_candidates)
     if addr_idx is None:
-        raise ValueError("Could not find Address column. Add your Address column name to address_candidates.")
+        raise ValueError("Could not find Address column.")
     if txn_idx is None:
-        raise ValueError("Could not find Transaction Amount column. Add your amount column name to txn_amt_candidates.")
+        raise ValueError("Could not find Transaction Amount column.")
 
     repaired_examples = []
     fixed_count = 0
@@ -147,7 +137,6 @@ def repair_address_spill(
             if len(row) <= txn_idx:
                 row = row + [""] * (txn_idx + 1 - len(row))
 
-            # If transaction cell already numeric -> row ok
             if txn_idx < len(row) and is_amount(row[txn_idx]):
                 if len(row) > expected_cols:
                     row = row[:expected_cols]
@@ -156,14 +145,12 @@ def repair_address_spill(
                 writer.writerow(row)
                 continue
 
-            # collect spill fragments until numeric found
             j = txn_idx
             spill = []
             while j < len(row) and not is_amount(row[j]):
                 spill.append(row[j])
                 j += 1
 
-            # if nothing to do -> align and write
             if j >= len(row) and not spill:
                 if len(row) > expected_cols:
                     row = row[:expected_cols]
@@ -191,7 +178,6 @@ def repair_address_spill(
                 new_row += [""] * (addr_idx + 1 - len(new_row))
                 new_row[addr_idx] = new_address
 
-            # remove spilled columns so subsequent numeric values shift left
             del new_row[txn_idx:j]
 
             if len(new_row) > expected_cols:
@@ -248,7 +234,7 @@ def merge_districts(paymeter_cleaned: str, district_path: str, out_path: str) ->
         return paymeter
 
 # -----------------------------
-# Step C: Merge Eko & Analyze (robust KCG detection + requested Excel sheets)
+# Step C: Merge Eko & Analyze → ONE Excel
 # -----------------------------
 def merge_and_analyze(
     eko_path: str,
@@ -256,14 +242,12 @@ def merge_and_analyze(
     district_info_path: Optional[str],
     kcg_path: Optional[str],
     out_detail: str,
-    out_summary: str,
     out_excel: str
-) -> None:
-    # load inputs
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
     eko = pd.read_csv(eko_path, dtype=str, keep_default_na=False)
     trans = pd.read_csv(trans_path, dtype=str, keep_default_na=False)
 
-    # create 'ref' keys
     if 'Request ID' in eko.columns:
         eko['ref'] = eko['Request ID'].astype(str).str.strip()
     elif 'ref' in eko.columns:
@@ -283,7 +267,6 @@ def merge_and_analyze(
 
     merged = pd.merge(eko, trans, on='ref', how='outer', suffixes=('_eko', '_trans'))
 
-    # District column best pick
     src_col = None
     for candidate in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT']:
         if candidate in merged.columns and merged[candidate].notna().any():
@@ -291,11 +274,9 @@ def merge_and_analyze(
             break
     merged['District'] = merged[src_col].astype(str).replace({'nan': None}).fillna('empty').astype(str).str.strip() if src_col else 'empty'
 
-    # pick amount columns (prefer *_trans)
     def pick_amount(col_list: List[str]) -> Optional[str]:
         for c in col_list:
             if c in merged.columns:
-                # if column exists and has at least one non-empty numeric-like value, pick it
                 s = merged[c].astype(str).str.replace(r'[,\s₦$]', '', regex=True).str.strip()
                 if s.replace('', '0').ne('').any():
                     return c
@@ -303,7 +284,6 @@ def merge_and_analyze(
 
     txn_candidates = ['Transaction Amount_trans', 'Transaction Amount', 'Transaction Amount_eko', 'Txn Amount', 'txn amount', 'Amount', 'amount', 'amt']
     total_candidates = ['Total Amount', 'Total Amount_eko', 'Total', 'total']
-
     txn_col = pick_amount(txn_candidates)
     total_col = pick_amount(total_candidates)
 
@@ -317,12 +297,10 @@ def merge_and_analyze(
     else:
         merged['Total Amount'] = 0.0
 
-    # calculations
     merged['fig_dif'] = merged['Total Amount'] - merged['Transaction Amount']
     merged['amt_less_vat'] = merged['Transaction Amount'] / 1.075
     merged['commission'] = merged['amt_less_vat'].apply(calculate_commission)
 
-    # build KCG set
     kcg_accounts = set()
     if kcg_path and os.path.exists(kcg_path):
         try:
@@ -330,15 +308,13 @@ def merge_and_analyze(
             kcg_col = pick_kcg_column(kcg_df)
             kcg_accounts = set(kcg_df[kcg_col].astype(str).apply(normalize_acct))
         except Exception:
-            kcg_accounts = set()
+            pass
 
-    # find plausible account columns in merged
     possible_account_columns = []
     for c in merged.columns:
         lc = c.lower()
         if 'account' in lc or 'acct' in lc or 'accountnumber' in lc.replace(' ', ''):
             possible_account_columns.append(c)
-    # add common names if present
     for candidate in ['Account Number', 'Account Number_trans', 'Account Number_eko', 'account', 'account_no', 'Acct', 'acct_no']:
         if candidate in merged.columns and candidate not in possible_account_columns:
             possible_account_columns.append(candidate)
@@ -354,21 +330,19 @@ def merge_and_analyze(
         except Exception:
             continue
 
-    # textual flags
     text_flag = pd.Series(False, index=merged.index)
     for flag_col in ("Disco Commission Type", "DiscoCommissionType", "Commission Type", "CommissionType", "Remarks", "Note"):
         if flag_col in merged.columns:
-            text_flag = text_flag | merged[flag_col].fillna('').astype(str).str.contains('kcg', case=False, na=False)
+            try:
+                text_flag = text_flag | merged[flag_col].fillna('').astype(str).str.contains('kcg', case=False, na=False)
+            except Exception:
+                pass
 
     merged['Is_KCG'] = (matched_any | text_flag).fillna(False)
 
-    # Prepare the summaries / sheets required by the user
-
-    # All accounts / split
     kcg_rows = merged.loc[merged['Is_KCG']].copy()
     non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
 
-    # Main summary (All / KCG / Non-KCG)
     main_summary = pd.DataFrame([
         {"Category": "All Accounts", "Count": len(merged),
          "Transaction Amount": merged['Transaction Amount'].sum(),
@@ -381,7 +355,6 @@ def merge_and_analyze(
          "Commission": non_kcg_rows['commission'].sum()}
     ])
 
-    # Non-KCG Ranges
     bins = [0, 10000, 20000, 40000, 60000, 80000, 100000, 200000, 300000, 500000, 1000000, float("inf")]
     labels = [
         "0 - 10,000", "10,001 - 20,000", "20,001 - 40,000", "40,001 - 60,000",
@@ -399,13 +372,12 @@ def merge_and_analyze(
     else:
         non_kcg_ranges = pd.DataFrame(columns=['Amount_Range','Transaction_Count','Total_Amount','Total_Commission'])
 
-    # All Accounts Summary (per account)
     account_col_candidates = [c for c in merged.columns if 'account' in c.lower()]
     acct_col = account_col_candidates[0] if account_col_candidates else 'Account Number_trans'
     if acct_col not in merged.columns:
         merged[acct_col] = merged.get('Account Number_trans', merged.index.astype(str))
     merged[acct_col] = merged[acct_col].astype(str).apply(normalize_acct)
-    # Customer name candidate
+
     cust_col = None
     for c in ['Customer Name', 'CustomerName', 'Name', 'Customer']:
         if c in merged.columns:
@@ -421,10 +393,8 @@ def merge_and_analyze(
         Total_Commission=('commission','sum')
     )
 
-    # Top 20 Accounts (by Transaction_Count then Total_Amount)
     top20 = account_summary.sort_values(by=['Transaction_Count','Total_Amount'], ascending=[False, False]).head(20)
 
-    # scenario No KCG
     scenario_no_kcg = pd.DataFrame([{
         "Category": "Scenario: Non-KCG Only",
         "Count": len(non_kcg_rows),
@@ -432,8 +402,6 @@ def merge_and_analyze(
         "Commission": non_kcg_rows['commission'].sum()
     }])
 
-    # Monthly Non-KCG / KCG / All
-    # Ensure Created At column exists and is datetime
     created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt']
     created_col = None
     for c in created_candidates:
@@ -454,23 +422,27 @@ def merge_and_analyze(
         Transaction_Amount=('Transaction Amount','sum'),
         Commission=('commission','sum')
     ).reset_index()
-
     monthly_kcg = kcg_rows.assign(Month=kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
         Count=('Transaction Amount','size'),
         Transaction_Amount=('Transaction Amount','sum'),
         Commission=('commission','sum')
     ).reset_index()
-
     monthly_all = merged.assign(Month=merged['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
         All_Count=('Transaction Amount','size'),
         All_Transaction_Amount=('Transaction Amount','sum'),
         All_Commission=('commission','sum')
     ).reset_index()
 
-    monthly_trends_combined = monthly_all.merge(monthly_kcg, on='Month', how='outer', suffixes=('', '_KCG'))
-    monthly_trends_combined = monthly_trends_combined.merge(monthly_non_kcg, on='Month', how='outer', suffixes=('', '_NonKCG')).fillna(0)
+    monthly_trends_combined = monthly_all.copy()
+    if not monthly_trends_combined.empty:
+        monthly_trends_combined = monthly_trends_combined.merge(monthly_kcg, on='Month', how='outer', suffixes=('', '_KCG'))
+        monthly_trends_combined = monthly_trends_combined.merge(monthly_non_kcg, on='Month', how='outer', suffixes=('', '_NonKCG')).fillna(0)
+    else:
+        monthly_trends_combined = pd.DataFrame(columns=[
+            'Month', 'All_Count', 'All_Transaction_Amount', 'All_Commission',
+            'Count', 'Transaction_Amount', 'Commission'
+        ])
 
-    # Projections (average of last up to 3 months)
     def build_projection(monthly_df):
         proj = pd.DataFrame()
         if monthly_df is not None and not monthly_df.empty:
@@ -483,9 +455,9 @@ def merge_and_analyze(
                 next_month = "proj"
             proj = pd.DataFrame([{
                 "Month": next_month,
-                "Projected_Count": round(recent['Count'].mean(), 0),
-                "Projected_Amount": round(recent['Transaction_Amount'].mean(), 2),
-                "Projected_Commission": round(recent['Commission'].mean(), 2),
+                "Projected_Count": round(recent['Count'].mean(), 0) if 'Count' in recent.columns else 0,
+                "Projected_Amount": round(recent['Transaction_Amount'].mean(), 2) if 'Transaction_Amount' in recent.columns else 0.0,
+                "Projected_Commission": round(recent['Commission'].mean(), 2) if 'Commission' in recent.columns else 0.0,
                 "Basis": f"Average of last {window} month(s)"
             }])
         return proj
@@ -493,221 +465,353 @@ def merge_and_analyze(
     projection_non_kcg = build_projection(monthly_non_kcg)
     projection_kcg = build_projection(monthly_kcg)
 
-    # Save detailed CSVs
-    merged.to_csv(out_detail, index=False)
+    # District Summary
     report = pd.DataFrame(merged['District'].unique(), columns=['District'])
     district_trans_totals = merged.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'paymeter_total'})
     district_eko_totals = merged.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'eko_total'})
     district_commission = merged.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'district_commission'})
-    report = report.merge(district_trans_totals, on='District', how='left').merge(district_eko_totals, on='District', how='left').merge(district_commission, on='District', how='left')
+    report = report.merge(district_trans_totals, on='District', how='left')\
+                   .merge(district_eko_totals, on='District', how='left')\
+                   .merge(district_commission, on='District', how='left')
     for c in ['paymeter_total','eko_total','district_commission']:
         if c in report.columns:
             report[c] = report[c].fillna(0.0)
     report['difference'] = report['eko_total'] - report['paymeter_total']
-    report.to_csv(out_summary, index=False)
 
-    # Excel workbook with exact sheets requested
-    try:
-        with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
-            # 1. Main Summary
-            main_summary.to_excel(writer, sheet_name="Main Summary", index=False)
-
-            # 2. Non-KCG Ranges
-            non_kcg_ranges.to_excel(writer, sheet_name="Non-KCG Ranges", index=False)
-
-            # 3. All Accounts Summary (per-account)
-            account_summary.to_excel(writer, sheet_name="All Accounts Summary", index=False)
-
-            # 4. Top 20 Accounts
-            top20.to_excel(writer, sheet_name="Top 20 Accounts", index=False)
-
-            # 5. scenario No KCG
-            scenario_no_kcg.to_excel(writer, sheet_name="scenario No KCG", index=False)
-
-            # 6. Monthly Non-KCG
-            monthly_non_kcg.to_excel(writer, sheet_name="Monthly Non-KCG", index=False)
-
-            # 7. Monthly KCG
-            monthly_kcg.to_excel(writer, sheet_name="Monthly KCG", index=False)
-
-            # 8. Monthly Trends (All)
-            monthly_trends_combined.to_excel(writer, sheet_name="Monthly Trends (All)", index=False)
-
-            # 9. Projection Non-KCG
-            if not projection_non_kcg.empty:
-                projection_non_kcg.to_excel(writer, sheet_name="Projection Non-KCG", index=False)
-            else:
-                # write an empty table with columns if empty
-                pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"]).to_excel(writer, sheet_name="Projection Non-KCG", index=False)
-
-            # 10. Projection KCG
-            if not projection_kcg.empty:
-                projection_kcg.to_excel(writer, sheet_name="Projection KCG", index=False)
-            else:
-                pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"]).to_excel(writer, sheet_name="Projection KCG", index=False)
-    except Exception as e:
-        raise RuntimeError(f"Error writing excel output {out_excel}: {e}")
-
-    # optional enrich report with district_info if provided
     if district_info_path and os.path.exists(district_info_path):
         try:
             district_info = pd.read_csv(district_info_path, dtype=str, keep_default_na=False)
             if 'district' in district_info.columns:
                 district_info = district_info.rename(columns={'district': 'District'})
             report = report.merge(district_info, on='District', how='left')
-            report.to_csv(out_summary, index=False)
         except Exception:
             pass
 
-    # audit empty district rows
+    audit_df = pd.DataFrame()
     try:
-        empty_rows = merged[merged['District'].str.lower() == 'empty']
+        empty_rows = merged[merged['District'].astype(str).str.lower() == 'empty']
         if not empty_rows.empty:
-            empty_rows.to_csv(BASE_DIR / "Audit_empty_district_rows.csv", index=False)
+            audit_path = BASE_DIR / "Audit_empty_district_rows.csv"
+            empty_rows.to_csv(audit_path, index=False)
+            audit_df = empty_rows
+            result['audit_empty_rows_path'] = str(audit_path)
     except Exception:
         pass
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Paymeter Processor", layout="wide")
-st.title("Paymeter + Eko Processor")
+    # WRITE ONE EXCEL
+    try:
+        with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
+            main_summary.to_excel(writer, sheet_name="Main Summary", index=False)
+            non_kcg_ranges.to_excel(writer, sheet_name="Non-KCG Ranges", index=False)
+            account_summary.to_excel(writer, sheet_name="All Accounts Summary", index=False)
+            top20.to_excel(writer, sheet_name="Top 20 Accounts", index=False)
+            scenario_no_kcg.to_excel(writer, sheet_name="Scenario No KCG", index=False)
+            monthly_non_kcg.to_excel(writer, sheet_name="Monthly Non-KCG", index=False)
+            monthly_kcg.to_excel(writer, sheet_name="Monthly KCG", index=False)
+            monthly_trends_combined.to_excel(writer, sheet_name="Monthly Trends (All)", index=False)
+            (projection_non_kcg if not projection_non_kcg.empty else pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"])).to_excel(writer, sheet_name="Projection Non-KCG", index=False)
+            (projection_kcg if not projection_kcg.empty else pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"])).to_excel(writer, sheet_name="Projection KCG", index=False)
+            report.to_excel(writer, sheet_name="District Summary", index=False)
+            if not audit_df.empty:
+                audit_df.to_excel(writer, sheet_name="Audit Empty District", index=False)
+            merged.to_csv(out_detail, index=False)
+    except Exception as e:
+        raise RuntimeError(f"Error writing Excel: {e}")
 
+    result.update({
+        "merged_df": merged,
+        "monthly_trends_combined": monthly_trends_combined,
+        "top20": top20,
+        "out_detail": out_detail,
+        "out_excel": out_excel
+    })
+    return result
+
+# =============================================
+# MODERN & FANCY STREAMLIT UI
+# =============================================
+
+st.set_page_config(page_title="Paymeter Pro", layout="wide", page_icon="lightning")
+
+# === CUSTOM CSS ===
 st.markdown("""
-Upload the **raw paymeter_report.csv** and **Eko Trans.csv** (required).
-Optional default reference files (`district.csv`, `KCG.csv`, `district_acct_number.csv`) can be placed in a `./data/` folder.
-You can upload updated versions to override for this run.
-""")
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+    html, body, [class*="css"] {font-family: 'Inter', sans-serif;}
+    
+    .main > div {padding-top: 1rem;}
+    .header-container {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 16px;
+        color: white;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        margin-bottom: 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1.5rem;
+        height: 140px;  /* Fixed height for logo fit */
+    }
+    .header-logo {
+        width: 120px;
+        height: 120px;
+        object-fit: contain;
+        border-radius: 12px;
+        background: transparent !important; /* Blend to gradient */
+        box-shadow: none; /* Remove shadow for better blend */
+    }
+    .header-text {
+        flex: 1;
+        text-align: left;
+    }
+    .header-title {font-size: 2.8rem; font-weight: 700; margin: 0;}
+    .header-subtitle {font-size: 1.1rem; opacity: 0.9; margin-top: 0.5rem;}
+    
+    .big-button {
+        background: linear-gradient(45deg, #FF6B6B, #FF8E53);
+        color: white;
+        font-size: 1.8rem !important;
+        font-weight: 700;
+        padding: 1.5rem 3rem !important;
+        border: none;
+        border-radius: 16px;
+        box-shadow: 0 8px 25px rgba(255, 107, 107, 0.4);
+        transition: all 0.3s ease;
+        width: 100%;
+        margin: 2rem 0;
+    }
+    .big-button:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 12px 30px rgba(255, 107, 107, 0.6);
+    }
+    
+    .card {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 1.5rem;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        border: 1px solid rgba(255,255,255,0.2);
+        margin-bottom: 1.5rem;
+    }
+    .file-status {
+        font-size: 0.9rem;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab-list"] {gap: 1rem;}
+    .stTabs [data-baseweb="tab"] {
+        background: #f0f2f6;
+        border-radius: 12px;
+        padding: 0.8rem 1.5rem;
+        font-weight: 600;
+        color: #555;
+    }
+    .stTabs [data-baseweb="tab"]:hover {background: #e0e6ed;}
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        background: linear-gradient(45deg, #667eea, #764ba2);
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# required uploads
-paymeter_file = st.file_uploader("Upload raw paymeter_report.csv (required)", type=["csv"])
-eko_file = st.file_uploader("Upload Eko Trans.csv (required)", type=["csv"])
+# === HEADER WITH GRADIENT UNDER LOGO ===
+logo_src = ""
+logo_status = ""
+if LOGO_PATH.exists():
+    try:
+        with open(LOGO_PATH, "rb") as logo_file:
+            logo_bytes = logo_file.read()
+            logo_base64 = base64.b64encode(logo_bytes).decode("utf-8")
+            logo_src = f"data:image/png;base64,{logo_base64}"
+            logo_status = "Logo loaded successfully!"
+    except Exception as e:
+        logo_status = f"Error loading logo: {e}"
+else:
+    logo_status = "Logo.png not found in data/ — no logo shown."
 
-st.write("---")
-st.header("Preloaded reference files (editable)")
+st.markdown(f"""
+<div class="header-container">
+    <img src="{logo_src}" class="header-logo" alt="Logo">
+    <div class="header-text">
+        <h1 class="header-title">Paymeter Pro</h1>
+        <p class="header-subtitle">Smart Repair • KCG Detection • One-Click Excel Report</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-def show_default(name: str, path: Path):
-    if path.exists():
-        st.success(f"Default {name} loaded from `data/{path.name}`")
-    else:
-        st.info(f"No default {name} found in ./data/ (optional)")
+# Debug status (remove after testing)
+st.sidebar.info(logo_status)
 
-show_default("district.csv", DEFAULT_DISTRICT)
-district_upload = st.file_uploader("Upload NEW district.csv to override (optional)", type=["csv"], key="district")
+# === SIDEBAR ===
+with st.sidebar:
+    st.markdown("### Required Files")
+    paymeter_file = st.file_uploader("**Paymeter Report CSV**", type=["csv"], key="paymeter")
+    eko_file = st.file_uploader("**Eko Trans CSV**", type=["csv"], key="eko")
 
-show_default("KCG.csv", DEFAULT_KCG)
-kcg_upload = st.file_uploader("Upload NEW KCG.csv to override (optional)", type=["csv"], key="kcg")
+    st.markdown("---")
+    st.markdown("### Optional Reference Files")
+    district_upload = st.file_uploader("`district.csv`", type=["csv"], key="district")
+    kcg_upload = st.file_uploader("`KCG.csv`", type=["csv"], key="kcg")
+    district_info_upload = st.file_uploader("`district_acct_number.csv`", type=["csv"], key="distinfo")
 
-show_default("district_acct_number.csv", DEFAULT_DISTRICT_INFO)
-district_info_upload = st.file_uploader("Upload NEW district_acct_number.csv to override (optional)", type=["csv"], key="district_info")
+    # Show status
+    st.markdown("---")
+    st.markdown("#### File Status")
+    def status(path, upload, name):
+        if upload:
+            st.markdown(f"<div class='file-status'>✅ {name} <span style='color:green'>Uploaded</span></div>", unsafe_allow_html=True)
+        elif path.exists():
+            st.markdown(f"<div class='file-status'>✅ {name} <span style='color:#4CAF50'>Default loaded</span></div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='file-status'>❌ {name} <span style='color:#999'>Not loaded</span></div>", unsafe_allow_html=True)
 
-st.write("---")
-preview_limit = st.number_input("Preview repaired rows (max examples)", min_value=1, max_value=50, value=8)
-run = st.button("Run pipeline")
+    status(DEFAULT_DISTRICT, district_upload, "district.csv")
+    status(DEFAULT_KCG, kcg_upload, "KCG.csv")
+    status(DEFAULT_DISTRICT_INFO, district_info_upload, "district_acct_number.csv")
 
-# helper to save uploaded file object to disk
-def save_uploaded_file(uploaded, dest: Path):
-    with open(dest, "wb") as f:
-        f.write(uploaded.getbuffer())
+    st.markdown("---")
+    preview_limit = st.slider("Preview repaired rows", 1, 20, 8)
 
+    # BIG BUTTON
+    run = st.button("GENERATE REPORT", key="run", help="Click to process and download full report")
+
+# === TABS ===
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Preview", "Results", "Logs"])
+
+# === OVERVIEW TAB WITH INSTRUCTIONS ===
+with tab1:
+    st.markdown("""
+    <div class="card">
+        <h3>How to Use Paymeter Pro</h3>
+        <ol>
+            <li><strong>Upload Required Files</strong>: <code>paymeter_report.csv</code> and <code>Eko Trans.csv</code></li>
+            <li><strong>Optional Files</strong>: Upload or use defaults in <code>data/</code> folder:
+                <ul>
+                    <li><code>district.csv</code> → Maps account to district</li>
+                    <li><code>KCG.csv</code> → List of KCG accounts</li>
+                    <li><code>district_acct_number.csv</code> → Extra info</li>
+                </ul>
+            </li>
+            <li><strong>Click "GENERATE REPORT"</strong> → Wait for magic</li>
+            <li><strong>Download</strong> the timestamped Excel with <strong>12+ sheets</strong></li>
+        </ol>
+        <p><strong>Tip</strong>: Test with small files first!</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+    m1 = col1.empty()
+    m2 = col2.empty()
+    m3 = col3.empty()
+    m1.metric("Rows Processed", "—")
+    m2.metric("Rows Fixed", "—")
+    m3.metric("Total Amount", "—")
+
+with tab2: preview_area = st.empty()
+with tab3: results_area = st.empty()
+with tab4: log_area = st.empty()
+
+# === RUN PIPELINE ===
 if run:
     if not paymeter_file or not eko_file:
-        st.error("Please upload both paymeter_report.csv and Eko Trans.csv to run the pipeline.")
+        st.error("Please upload both required CSV files.")
     else:
-        work_dir = Path(tempfile.mkdtemp(prefix="paymeter_ui_"))
-        st.info(f"Working directory (temporary): {work_dir}")
+        work_dir = Path(tempfile.mkdtemp(prefix="paymeter_"))
+        st.sidebar.success(f"Working: `{work_dir.name}`")
+
+        fixed_count = 0
+        out_detail = out_excel = None
 
         try:
-            # Save required uploads
+            # Save files
             paymeter_path = work_dir / "paymeter_report.csv"
-            save_uploaded_file(paymeter_file, paymeter_path)
-            eko_path = work_dir / "Eko Trans.csv"
-            save_uploaded_file(eko_file, eko_path)
+            eko_path = work_dir / "eko_trans.csv"
+            with open(paymeter_path, "wb") as f: f.write(paymeter_file.getbuffer())
+            with open(eko_path, "wb") as f: f.write(eko_file.getbuffer())
 
-            # pick district path: uploaded -> default -> None
+            district_path = DEFAULT_DISTRICT if DEFAULT_DISTRICT.exists() and not district_upload else None
             if district_upload:
                 district_path = work_dir / "district.csv"
-                save_uploaded_file(district_upload, district_path)
-                st.success("Using uploaded district.csv")
-            elif DEFAULT_DISTRICT.exists():
-                district_path = DEFAULT_DISTRICT
-                st.success(f"Using default district.csv from {DEFAULT_DISTRICT}")
-            else:
-                district_path = None
-                st.info("No district.csv will be used (optional)")
+                with open(district_path, "wb") as f: f.write(district_upload.getbuffer())
 
-            # pick KCG path
+            kcg_path = DEFAULT_KCG if DEFAULT_KCG.exists() and not kcg_upload else None
             if kcg_upload:
-                kcg_path = work_dir / "KCG.csv"
-                save_uploaded_file(kcg_upload, kcg_path)
-                st.success("Using uploaded KCG.csv")
-            elif DEFAULT_KCG.exists():
-                kcg_path = DEFAULT_KCG
-                st.success(f"Using default KCG.csv from {DEFAULT_KCG}")
-            else:
-                kcg_path = None
-                st.info("No KCG.csv will be used (optional)")
+                kcg_path = work_dir / "kcg.csv"
+                with open(kcg_path, "wb") as f: f.write(kcg_upload.getbuffer())
 
-            # pick district_info path
+            district_info_path = DEFAULT_DISTRICT_INFO if DEFAULT_DISTRICT_INFO.exists() and not district_info_upload else None
             if district_info_upload:
-                district_info_path = work_dir / "district_acct_number.csv"
-                save_uploaded_file(district_info_upload, district_info_path)
-                st.success("Using uploaded district_acct_number.csv")
-            elif DEFAULT_DISTRICT_INFO.exists():
-                district_info_path = DEFAULT_DISTRICT_INFO
-                st.success(f"Using default district_acct_number.csv from {DEFAULT_DISTRICT_INFO}")
-            else:
-                district_info_path = None
-                st.info("No district_acct_number.csv will be used (optional)")
+                district_info_path = work_dir / "district_info.csv"
+                with open(district_info_path, "wb") as f: f.write(district_info_upload.getbuffer())
 
-            # Step A: repair address spill
-            st.info("Running address-spill repair...")
-            cleaned = work_dir / "paymeter_report_cleaned.csv"
-            fixed_count, examples = repair_address_spill(str(paymeter_path), str(cleaned), preview_limit=preview_limit)
-            st.success(f"Address repair finished — rows fixed: {fixed_count}")
+            # Step 1
+            with st.spinner("Repairing address spills..."):
+                cleaned = work_dir / "cleaned.csv"
+                fixed_count, examples = repair_address_spill(str(paymeter_path), str(cleaned), preview_limit=preview_limit)
 
-            if examples:
-                st.subheader("Sample repaired rows")
-                for ex in examples:
-                    st.write(f"Line {ex['line']}")
-                    st.write("Before:", ex['before'])
-                    st.write("After :", ex['after'])
+            # Step 2
+            with st.spinner("Merging district data..."):
+                bydistrict = work_dir / "bydistrict.csv"
+                if district_path:
+                    merge_districts(str(cleaned), str(district_path), str(bydistrict))
+                else:
+                    shutil.copy2(cleaned, bydistrict)
 
-            # Step B: merge district
-            st.info("Merging district data (if provided)...")
-            bydistrict = work_dir / "paymeter_report_cleaned_byDistrict.csv"
-            if district_path:
-                merge_districts(str(cleaned), str(district_path), str(bydistrict))
-                st.success("District merge completed.")
-            else:
-                shutil.copy2(cleaned, bydistrict)
-                st.info("No district file: cleaned file copied forward.")
+            # Step 3
+            with st.spinner("Generating final report..."):
+                out_detail = work_dir / "detail.csv"
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                out_excel = work_dir / f"PaymeterReport_{timestamp}.xlsx"
+                result = merge_and_analyze(
+                    str(eko_path), str(bydistrict),
+                    str(district_info_path) if district_info_path else None,
+                    str(kcg_path) if kcg_path else None,
+                    str(out_detail), str(out_excel)
+                )
 
-            # Step C: merge Eko and analyze
-            st.info("Merging Eko and generating reports...")
-            out_detail = work_dir / "Paymeter&EkoReport.csv"
-            out_summary = work_dir / "SummaryReport.csv"
-            out_excel = work_dir / "Paymeter_Report_FixedKCG.xlsx"
+            detail_df = pd.read_csv(out_detail, dtype=str, keep_default_na=False)
+            txn_sum = pd.to_numeric(detail_df['Transaction Amount'].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0).sum()
 
-            merge_and_analyze(
-                str(eko_path),
-                str(bydistrict),
-                district_info_path=str(district_info_path) if district_info_path else None,
-                kcg_path=str(kcg_path) if kcg_path else None,
-                out_detail=str(out_detail),
-                out_summary=str(out_summary),
-                out_excel=str(out_excel)
-            )
-            st.success("Merge & analysis completed.")
+            # === UPDATE UI ===
+            with tab1:
+                m1.metric("Rows Processed", len(detail_df))
+                m2.metric("Rows Fixed", fixed_count)
+                m3.metric("Total Amount", f"₦{txn_sum:,.2f}")
 
-            # Downloads
-            st.header("Download outputs")
-            with open(cleaned, "rb") as f: st.download_button("Download cleaned paymeter CSV", f.read(), file_name="paymeter_report_cleaned.csv", mime="text/csv")
-            with open(bydistrict, "rb") as f: st.download_button("Download paymeter by district CSV", f.read(), file_name="paymeter_report_cleaned_byDistrict.csv", mime="text/csv")
-            with open(out_detail, "rb") as f: st.download_button("Download detailed merged CSV", f.read(), file_name="Paymeter&EkoReport.csv", mime="text/csv")
-            with open(out_summary, "rb") as f: st.download_button("Download summary CSV", f.read(), file_name="SummaryReport.csv", mime="text/csv")
-            with open(out_excel, "rb") as f: st.download_button("Download Excel workbook", f.read(), file_name="Paymeter_Report_FixedKCG.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with tab2:
+                if examples:
+                    st.success(f"Fixed {fixed_count} rows")
+                    for ex in examples:
+                        st.markdown(f"**Line {ex['line']}**")
+                        b, a = st.columns(2)
+                        b.code(" → ".join(ex['before']))
+                        a.code(" → ".join(ex['after']))
+                st.dataframe(detail_df.head(10))
 
-            st.info(f"Temporary files are in: {work_dir} — delete them when you no longer need them.")
-        except Exception as err:
-            st.error(f"Error during processing: {err}")
+            with tab3:
+                st.balloons()
+                st.success("Report Generated!")
+                c1, c2 = st.columns(2)
+                with c1:
+                    with open(cleaned, "rb") as f:
+                        st.download_button("Cleaned Paymeter", f.read(), "cleaned.csv", "text/csv")
+                    with open(out_detail, "rb") as f:
+                        st.download_button("Detailed Merged", f.read(), "detail.csv", "text/csv")
+                with c2:
+                    with open(out_excel, "rb") as f:
+                        st.download_button(
+                            "DOWNLOAD FULL REPORT (Excel)",
+                            f.read(),
+                            out_excel.name,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                st.info(f"**{out_excel.name}** includes **12+ sheets**")
+
+            with tab4:
+                log_area.code(f"Fixed: {fixed_count}\nDetail: {out_detail}\nExcel: {out_excel}")
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+            log_area.text(str(e))
