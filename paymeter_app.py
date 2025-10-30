@@ -11,7 +11,7 @@ import re
 import os
 import shutil
 import tempfile
-import base64  # For logo encoding
+import base64
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, date
@@ -29,8 +29,14 @@ DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
 LOGO_PATH = DATA_DIR / "Logo.png"
 
+# === EMBEDDED LOGO (Base64) - REPLACE THIS WITH YOUR LOGO ===
+# How to generate: https://www.base64-image.de/ → Upload Logo.png → Copy base64 string
+EMBEDDED_LOGO_BASE64 = """
+iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHVVAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibcAAAABl0RVh0U29...
+"""  # ← PASTE YOUR FULL BASE64 STRING HERE (after the comma)
+
 # ----------------------------------------------------------------------
-# Helper: robust CSV reader (handles stray commas / line-breaks)
+# Helper: robust CSV reader
 # ----------------------------------------------------------------------
 def safe_read_csv(path: Path) -> pd.DataFrame:
     with open(path, 'r', encoding='utf-8', newline='') as f:
@@ -50,7 +56,7 @@ def safe_read_csv(path: Path) -> pd.DataFrame:
     return df.astype(str)
 
 # ----------------------------------------------------------------------
-# Helper: make DataFrame columns unique (to avoid duplicate name errors)
+# Helper: make DataFrame columns unique
 # ----------------------------------------------------------------------
 def make_columns_unique(df: pd.DataFrame) -> pd.DataFrame:
     cols = df.columns.tolist()
@@ -72,7 +78,7 @@ def make_columns_unique(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -----------------------------
-# Utility helpers (unchanged)
+# Utility helpers
 # -----------------------------
 _amount_re = re.compile(r"""^\s*[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*$""")
 
@@ -293,14 +299,12 @@ def merge_and_analyze(
     eko   = safe_read_csv(Path(eko_path))
     trans = safe_read_csv(Path(trans_path))
 
-    # Pre-clean: keep only ONE copy of common columns
     eko_keep = ['Request ID', 'Transaction Date', 'Account Number', 'Total Amount']
     trans_keep = ['Reference', 'Created At', 'Account Number', 'Transaction Amount']
 
     eko = eko.drop(columns=[c for c in trans_keep if c in eko.columns], errors='ignore')
     trans = trans.drop(columns=[c for c in eko_keep if c in trans.columns], errors='ignore')
 
-    # Build ref
     if 'Request ID' in eko.columns:
         eko['ref'] = eko['Request ID'].astype(str).str.strip()
     else:
@@ -314,10 +318,8 @@ def merge_and_analyze(
     eko['source'] = 'eko'
     trans['source'] = 'paymeter'
 
-    # Merge
     merged = pd.merge(eko, trans, on='ref', how='outer', suffixes=('_eko', '_trans'))
 
-    # District
     src_col = None
     for candidate in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT']:
         if candidate in merged.columns and merged[candidate].notna().any():
@@ -325,7 +327,6 @@ def merge_and_analyze(
             break
     merged['District'] = merged[src_col].astype(str).replace({'nan': None}).fillna('empty').astype(str).str.strip() if src_col else 'empty'
 
-    # Amount columns
     def pick_amount(col_list: List[str]) -> Optional[str]:
         for c in col_list:
             if c in merged.columns:
@@ -353,7 +354,6 @@ def merge_and_analyze(
     merged['amt_less_vat'] = merged['Transaction Amount'] / 1.075
     merged['commission'] = merged['amt_less_vat'].apply(calculate_commission)
 
-    # KCG
     kcg_accounts = set()
     if kcg_path and os.path.exists(kcg_path):
         try:
@@ -393,7 +393,6 @@ def merge_and_analyze(
     kcg_rows = merged.loc[merged['Is_KCG']].copy()
     non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
 
-    # Summaries
     main_summary = pd.DataFrame([
         {"Category": "All Accounts", "Count": len(merged),
          "Transaction Amount": merged['Transaction Amount'].sum(),
@@ -516,7 +515,6 @@ def merge_and_analyze(
     projection_non_kcg = build_projection(monthly_non_kcg)
     projection_kcg = build_projection(monthly_kcg)
 
-    # District Summary
     report = pd.DataFrame(merged['District'].unique(), columns=['District'])
     district_trans_totals = merged.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'paymeter_total'})
     district_eko_totals = merged.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'eko_total'})
@@ -549,7 +547,6 @@ def merge_and_analyze(
     except Exception:
         pass
 
-    # Make columns unique to avoid duplicate name errors
     merged = make_columns_unique(merged)
     report = make_columns_unique(report)
     account_summary = make_columns_unique(account_summary)
@@ -564,7 +561,6 @@ def merge_and_analyze(
     projection_kcg = make_columns_unique(projection_kcg)
     audit_df = make_columns_unique(audit_df)
 
-    # WRITE ONE EXCEL
     try:
         with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
             main_summary.to_excel(writer, sheet_name="Main Summary", index=False)
@@ -599,7 +595,7 @@ def merge_and_analyze(
 
 st.set_page_config(page_title="Paymeter Pro", layout="wide", page_icon="lightning")
 
-# === CUSTOM CSS ===
+# === CUSTOM CSS (Responsive) ===
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -679,23 +675,48 @@ st.markdown("""
         background: linear-gradient(45deg, #667eea, #764ba2);
         color: white;
     }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+        .header-container {
+            flex-direction: column;
+            text-align: center;
+            height: auto;
+            padding: 1rem;
+        }
+        .header-logo {
+            width: 80px;
+            height: 80px;
+        }
+        .header-title {
+            font-size: 2rem;
+        }
+        .header-subtitle {
+            font-size: 1rem;
+        }
+        .big-button {
+            font-size: 1.4rem !important;
+            padding: 1rem 2rem !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# === HEADER WITH GRADIENT UNDER LOGO ===
+# === LOGO LOADING (File → Embedded Fallback) ===
 logo_src = ""
-logo_status = ""
+logo_status = "Logo not loaded"
+
 if LOGO_PATH.exists():
     try:
-        with open(LOGO_PATH, "rb") as logo_file:
-            logo_bytes = logo_file.read()
-            logo_base64 = base64.b64encode(logo_bytes).decode("utf-8")
-            logo_src = f"data:image/png;base64,{logo_base64}"
-            logo_status = "Logo loaded successfully!"
+        with open(LOGO_PATH, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+            logo_src = f"data:image/png;base64,{b64}"
+            logo_status = "Logo: Loaded from data/Logo.png"
     except Exception as e:
-        logo_status = f"Error loading logo: {e}"
+        logo_status = f"File error: {e}"
 else:
-    logo_status = "Logo.png not found in data/ — no logo shown."
+    logo_src = f"data:image/png;base64,{EMBEDDED_LOGO_BASE64.strip()}"
+    logo_status = "Logo: Using embedded version (file not found)"
 
 st.markdown(f"""
 <div class="header-container">
@@ -817,7 +838,6 @@ if check_dates:
             pay_df = safe_read_csv(paymeter_path)
             eko_df = safe_read_csv(eko_path)
 
-            # Paymeter dates
             try:
                 pay_dates = pd.to_datetime(pay_df['Created At'], errors='coerce').dropna()
                 if not pay_dates.empty:
@@ -828,7 +848,6 @@ if check_dates:
             except KeyError:
                 st.session_state.pay_min = st.session_state.pay_max = None
 
-            # Eko dates
             try:
                 eko_dates = pd.to_datetime(eko_df['Transaction Date'], errors='coerce').dropna()
                 if not eko_dates.empty:
@@ -856,7 +875,6 @@ if run:
         out_detail = out_excel = None
 
         try:
-            # Save files
             paymeter_path = work_dir / "paymeter_report.csv"
             eko_path = work_dir / "eko_trans.csv"
             with open(paymeter_path, "wb") as f: f.write(paymeter_file.getbuffer())
@@ -877,12 +895,10 @@ if run:
                 district_info_path = work_dir / "district_info.csv"
                 with open(district_info_path, "wb") as f: f.write(district_info_upload.getbuffer())
 
-            # Step 1: Clean all records
             with st.spinner("Repairing address spills..."):
                 cleaned = work_dir / "cleaned.csv"
                 fixed_count, examples = repair_address_spill(str(paymeter_path), str(cleaned), preview_limit=preview_limit)
 
-            # Step 2: Merge districts
             with st.spinner("Merging district data..."):
                 bydistrict = work_dir / "bydistrict.csv"
                 if district_path:
@@ -890,17 +906,14 @@ if run:
                 else:
                     shutil.copy2(cleaned, bydistrict)
 
-            # Load cleaned data
             trans_df = safe_read_csv(bydistrict)
             eko_df   = safe_read_csv(eko_path)
 
-            # Parse dates
             if 'Created At' in trans_df.columns:
                 trans_df['Created At'] = pd.to_datetime(trans_df['Created At'], errors='coerce')
             if 'Transaction Date' in eko_df.columns:
                 eko_df['Transaction Date'] = pd.to_datetime(eko_df['Transaction Date'], errors='coerce')
 
-            # === VALIDATE DATE RANGE ===
             start_date, end_date = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (None, None)
             if start_date and end_date:
                 start_ts = pd.Timestamp(start_date)
@@ -929,7 +942,6 @@ if run:
                         st.warning(f"Warning: {err}")
                     st.stop()
 
-                # === APPLY FILTER ===
                 with st.spinner("Filtering data by selected date range..."):
                     def _date_floor(s):
                         return pd.to_datetime(s).dt.floor('D')
@@ -942,13 +954,11 @@ if run:
                         eko_mask = (_date_floor(eko_df['Transaction Date']) >= start_ts) & (_date_floor(eko_df['Transaction Date']) <= end_ts)
                         eko_df = eko_df[eko_mask]
 
-            # Save filtered
             filtered_trans = work_dir / "filtered_trans.csv"
             filtered_eko = work_dir / "filtered_eko.csv"
             trans_df.to_csv(filtered_trans, index=False)
             eko_df.to_csv(filtered_eko, index=False)
 
-            # Step 3: Generate report
             with st.spinner("Generating final report..."):
                 out_detail = work_dir / "detail.csv"
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -963,7 +973,6 @@ if run:
             detail_df = safe_read_csv(Path(out_detail))
             txn_sum = pd.to_numeric(detail_df['Transaction Amount'].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0).sum()
 
-            # === UPDATE UI ===
             with tab1:
                 m1.metric("Rows Processed", len(detail_df))
                 m2.metric("Rows Fixed", fixed_count)
