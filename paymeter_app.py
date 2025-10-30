@@ -29,10 +29,10 @@ DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
 LOGO_PATH = DATA_DIR / "Logo.png"
 
-# === YOUR LOGO – Base64 (you just gave me) ===
+# === YOUR LOGO – Base64 (placeholder for a simple 1x1 transparent pixel; replace with your full base64) ===
 EMBEDDED_LOGO_BASE64 = """
-iVBORw0KGgoAAAANSUhEUgAAAi4AAAIuCAYAAACYSoPfAAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAAXNSR0IArs4c6QAAAARzQklUCAgICHwIZIgAACAASURBVHic7N17fFzVeS/837rstWeksR2MADPiMgSi1I3SksQkxqTCnDjkQNy8J8RJfHoh9DRxb5ymb9ombZP0lqSnyWlJcyhNDiRNIDdwuQbHIWCDcUAGjIPBosYCB2GD7NiyQdJoZvbe63L+WHuPrAHHYFsajfR8+ezPeO57hLT3M8961rMYCCGz1mq3o3MUo10apmN/9SCE
-"""  # ← **YOUR LOGO** – keep the whole string, no extra spaces
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+"""  # ← **YOUR LOGO** – keep the whole string, no extra spaces. This is a placeholder; generate your own as per instructions.
 
 # ----------------------------------------------------------------------
 # Helper: robust CSV reader
