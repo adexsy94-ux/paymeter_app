@@ -27,7 +27,7 @@ DATA_DIR = BASE_DIR / "data"
 DEFAULT_DISTRICT = DATA_DIR / "district.csv"
 DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
-LOGO_PATH = DATA_DIR / "Logo.png"
+LOGO_PATH = DATA_DIR / "logo.png"
 
 # === YOUR LOGO – Base64 (placeholder for a simple 1x1 transparent pixel; replace with your full base64) ===
 EMBEDDED_LOGO_BASE64 = """
@@ -736,7 +736,7 @@ if LOGO_PATH.exists():
         with open(LOGO_PATH, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
             logo_src = f"data:image/png;base64,{b64}"
-            logo_status = "Logo: Loaded from data/Logo.png"
+            logo_status = "Logo: Loaded from data/logo.png"
     except Exception as e:
         logo_status = f"File error: {e}"
 else:
