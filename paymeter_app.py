@@ -14,7 +14,7 @@ import tempfile
 import base64  # For logo encoding
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
@@ -28,6 +28,48 @@ DEFAULT_DISTRICT = DATA_DIR / "district.csv"
 DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
 LOGO_PATH = DATA_DIR / "Logo.png"
+
+# ----------------------------------------------------------------------
+# Helper: robust CSV reader (handles stray commas / line-breaks)
+# ----------------------------------------------------------------------
+def safe_read_csv(path: Path) -> pd.DataFrame:
+    with open(path, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    if not rows:
+        return pd.DataFrame()
+    header = rows[0]
+    data = rows[1:]
+    max_cols = max(len(row) for row in rows)
+    for row in data:
+        if len(row) < max_cols:
+            row.extend([''] * (max_cols - len(row)))
+    if len(header) < max_cols:
+        header = header + [f'Unnamed_{i}' for i in range(len(header), max_cols)]
+    df = pd.DataFrame(data, columns=header)
+    return df.astype(str)
+
+# ----------------------------------------------------------------------
+# Helper: make DataFrame columns unique (to avoid duplicate name errors)
+# ----------------------------------------------------------------------
+def make_columns_unique(df: pd.DataFrame) -> pd.DataFrame:
+    cols = df.columns.tolist()
+    seen = set()
+    unique_cols = []
+    for c in cols:
+        if c in seen:
+            i = 1
+            new_c = f"{c}_{i}"
+            while new_c in seen:
+                i += 1
+                new_c = f"{c}_{i}"
+            unique_cols.append(new_c)
+            seen.add(new_c)
+        else:
+            unique_cols.append(c)
+            seen.add(c)
+    df.columns = unique_cols
+    return df
 
 # -----------------------------
 # Utility helpers (unchanged)
@@ -203,9 +245,9 @@ def repair_address_spill(
 # Step B: Merge district lookup
 # -----------------------------
 def merge_districts(paymeter_cleaned: str, district_path: str, out_path: str) -> pd.DataFrame:
-    paymeter = pd.read_csv(paymeter_cleaned, dtype=str, keep_default_na=False)
+    paymeter = safe_read_csv(Path(paymeter_cleaned))
     if district_path and os.path.exists(district_path):
-        district = pd.read_csv(district_path, dtype=str, keep_default_na=False)
+        district = safe_read_csv(Path(district_path))
         if 'paymeter Account Number' in district.columns and 'DISTRICT BY ADDRESS' in district.columns:
             district = district[['paymeter Account Number', 'DISTRICT BY ADDRESS']].drop_duplicates(subset=['paymeter Account Number'])
             district.rename(columns={'paymeter Account Number': 'Account Number'}, inplace=True)
@@ -222,14 +264,17 @@ def merge_districts(paymeter_cleaned: str, district_path: str, out_path: str) ->
                 district = district[[acct_col, dist_col]].drop_duplicates(subset=[acct_col])
                 district.columns = ['Account Number', 'DISTRICT BY ADDRESS']
             else:
+                paymeter = make_columns_unique(paymeter)
                 paymeter.to_csv(out_path, index=False)
                 return paymeter
 
         merged = paymeter.merge(district, on='Account Number', how='left')
         merged['District Name'] = merged['DISTRICT BY ADDRESS'].combine_first(merged.get('District Name', pd.Series(dtype=str)))
+        merged = make_columns_unique(merged)
         merged.to_csv(out_path, index=False)
         return merged
     else:
+        paymeter = make_columns_unique(paymeter)
         paymeter.to_csv(out_path, index=False)
         return paymeter
 
@@ -245,28 +290,34 @@ def merge_and_analyze(
     out_excel: str
 ) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
-    eko = pd.read_csv(eko_path, dtype=str, keep_default_na=False)
-    trans = pd.read_csv(trans_path, dtype=str, keep_default_na=False)
+    eko   = safe_read_csv(Path(eko_path))
+    trans = safe_read_csv(Path(trans_path))
 
+    # Pre-clean: keep only ONE copy of common columns
+    eko_keep = ['Request ID', 'Transaction Date', 'Account Number', 'Total Amount']
+    trans_keep = ['Reference', 'Created At', 'Account Number', 'Transaction Amount']
+
+    eko = eko.drop(columns=[c for c in trans_keep if c in eko.columns], errors='ignore')
+    trans = trans.drop(columns=[c for c in eko_keep if c in trans.columns], errors='ignore')
+
+    # Build ref
     if 'Request ID' in eko.columns:
         eko['ref'] = eko['Request ID'].astype(str).str.strip()
-    elif 'ref' in eko.columns:
-        eko['ref'] = eko['ref'].astype(str).str.strip()
     else:
         eko['ref'] = eko.index.astype(str)
 
     if 'Reference' in trans.columns:
         trans['ref'] = trans['Reference'].astype(str).str.strip()
-    elif 'ref' in trans.columns:
-        trans['ref'] = trans['ref'].astype(str).str.strip()
     else:
         trans['ref'] = trans.index.astype(str)
 
     eko['source'] = 'eko'
     trans['source'] = 'paymeter'
 
+    # Merge
     merged = pd.merge(eko, trans, on='ref', how='outer', suffixes=('_eko', '_trans'))
 
+    # District
     src_col = None
     for candidate in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT']:
         if candidate in merged.columns and merged[candidate].notna().any():
@@ -274,6 +325,7 @@ def merge_and_analyze(
             break
     merged['District'] = merged[src_col].astype(str).replace({'nan': None}).fillna('empty').astype(str).str.strip() if src_col else 'empty'
 
+    # Amount columns
     def pick_amount(col_list: List[str]) -> Optional[str]:
         for c in col_list:
             if c in merged.columns:
@@ -301,10 +353,11 @@ def merge_and_analyze(
     merged['amt_less_vat'] = merged['Transaction Amount'] / 1.075
     merged['commission'] = merged['amt_less_vat'].apply(calculate_commission)
 
+    # KCG
     kcg_accounts = set()
     if kcg_path and os.path.exists(kcg_path):
         try:
-            kcg_df = pd.read_csv(kcg_path, dtype=str, keep_default_na=False)
+            kcg_df = safe_read_csv(Path(kcg_path))
             kcg_col = pick_kcg_column(kcg_df)
             kcg_accounts = set(kcg_df[kcg_col].astype(str).apply(normalize_acct))
         except Exception:
@@ -315,9 +368,6 @@ def merge_and_analyze(
         lc = c.lower()
         if 'account' in lc or 'acct' in lc or 'accountnumber' in lc.replace(' ', ''):
             possible_account_columns.append(c)
-    for candidate in ['Account Number', 'Account Number_trans', 'Account Number_eko', 'account', 'account_no', 'Acct', 'acct_no']:
-        if candidate in merged.columns and candidate not in possible_account_columns:
-            possible_account_columns.append(candidate)
 
     matched_any = pd.Series(False, index=merged.index)
     for col in possible_account_columns:
@@ -343,6 +393,7 @@ def merge_and_analyze(
     kcg_rows = merged.loc[merged['Is_KCG']].copy()
     non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
 
+    # Summaries
     main_summary = pd.DataFrame([
         {"Category": "All Accounts", "Count": len(merged),
          "Transaction Amount": merged['Transaction Amount'].sum(),
@@ -480,7 +531,7 @@ def merge_and_analyze(
 
     if district_info_path and os.path.exists(district_info_path):
         try:
-            district_info = pd.read_csv(district_info_path, dtype=str, keep_default_na=False)
+            district_info = safe_read_csv(Path(district_info_path))
             if 'district' in district_info.columns:
                 district_info = district_info.rename(columns={'district': 'District'})
             report = report.merge(district_info, on='District', how='left')
@@ -498,6 +549,21 @@ def merge_and_analyze(
     except Exception:
         pass
 
+    # Make columns unique to avoid duplicate name errors
+    merged = make_columns_unique(merged)
+    report = make_columns_unique(report)
+    account_summary = make_columns_unique(account_summary)
+    top20 = make_columns_unique(top20)
+    main_summary = make_columns_unique(main_summary)
+    non_kcg_ranges = make_columns_unique(non_kcg_ranges)
+    scenario_no_kcg = make_columns_unique(scenario_no_kcg)
+    monthly_non_kcg = make_columns_unique(monthly_non_kcg)
+    monthly_kcg = make_columns_unique(monthly_kcg)
+    monthly_trends_combined = make_columns_unique(monthly_trends_combined)
+    projection_non_kcg = make_columns_unique(projection_non_kcg)
+    projection_kcg = make_columns_unique(projection_kcg)
+    audit_df = make_columns_unique(audit_df)
+
     # WRITE ONE EXCEL
     try:
         with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
@@ -509,8 +575,8 @@ def merge_and_analyze(
             monthly_non_kcg.to_excel(writer, sheet_name="Monthly Non-KCG", index=False)
             monthly_kcg.to_excel(writer, sheet_name="Monthly KCG", index=False)
             monthly_trends_combined.to_excel(writer, sheet_name="Monthly Trends (All)", index=False)
-            (projection_non_kcg if not projection_non_kcg.empty else pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"])).to_excel(writer, sheet_name="Projection Non-KCG", index=False)
-            (projection_kcg if not projection_kcg.empty else pd.DataFrame(columns=["Month","Projected_Count","Projected_Amount","Projected_Commission","Basis"])).to_excel(writer, sheet_name="Projection KCG", index=False)
+            projection_non_kcg.to_excel(writer, sheet_name="Projection Non-KCG", index=False)
+            projection_kcg.to_excel(writer, sheet_name="Projection KCG", index=False)
             report.to_excel(writer, sheet_name="District Summary", index=False)
             if not audit_df.empty:
                 audit_df.to_excel(writer, sheet_name="Audit Empty District", index=False)
@@ -550,15 +616,15 @@ st.markdown("""
         display: flex;
         align-items: center;
         gap: 1.5rem;
-        height: 140px;  /* Fixed height for logo fit */
+        height: 140px;
     }
     .header-logo {
         width: 120px;
         height: 120px;
         object-fit: contain;
         border-radius: 12px;
-        background: transparent !important; /* Blend to gradient */
-        box-shadow: none; /* Remove shadow for better blend */
+        background: transparent !important;
+        box-shadow: none;
     }
     .header-text {
         flex: 1;
@@ -641,8 +707,19 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Debug status (remove after testing)
 st.sidebar.info(logo_status)
+
+# Initialize session state
+if 'dates_checked' not in st.session_state:
+    st.session_state.dates_checked = False
+if 'pay_min' not in st.session_state:
+    st.session_state.pay_min = None
+if 'pay_max' not in st.session_state:
+    st.session_state.pay_max = None
+if 'eko_min' not in st.session_state:
+    st.session_state.eko_min = None
+if 'eko_max' not in st.session_state:
+    st.session_state.eko_max = None
 
 # === SIDEBAR ===
 with st.sidebar:
@@ -656,16 +733,15 @@ with st.sidebar:
     kcg_upload = st.file_uploader("`KCG.csv`", type=["csv"], key="kcg")
     district_info_upload = st.file_uploader("`district_acct_number.csv`", type=["csv"], key="distinfo")
 
-    # Show status
     st.markdown("---")
     st.markdown("#### File Status")
     def status(path, upload, name):
         if upload:
-            st.markdown(f"<div class='file-status'>✅ {name} <span style='color:green'>Uploaded</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='file-status'>Uploaded {name} <span style='color:green'>Uploaded</span></div>", unsafe_allow_html=True)
         elif path.exists():
-            st.markdown(f"<div class='file-status'>✅ {name} <span style='color:#4CAF50'>Default loaded</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='file-status'>Default {name} <span style='color:#4CAF50'>Loaded</span></div>", unsafe_allow_html=True)
         else:
-            st.markdown(f"<div class='file-status'>❌ {name} <span style='color:#999'>Not loaded</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='file-status'>Not loaded {name} <span style='color:#999'>Not loaded</span></div>", unsafe_allow_html=True)
 
     status(DEFAULT_DISTRICT, district_upload, "district.csv")
     status(DEFAULT_KCG, kcg_upload, "KCG.csv")
@@ -674,32 +750,46 @@ with st.sidebar:
     st.markdown("---")
     preview_limit = st.slider("Preview repaired rows", 1, 20, 8)
 
-    # BIG BUTTON
+    check_dates = st.button("Check Date Ranges", key="check_dates")
+
+    default_start = st.session_state.pay_min if st.session_state.pay_min else date.today()
+    default_end = st.session_state.pay_max if st.session_state.pay_max else date.today()
+    date_range = st.date_input(
+        "Select Report Date Range",
+        value=(default_start, default_end),
+        min_value=st.session_state.pay_min,
+        max_value=st.session_state.pay_max,
+        key="date_range"
+    )
+
     run = st.button("GENERATE REPORT", key="run", help="Click to process and download full report")
 
 # === TABS ===
 tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Preview", "Results", "Logs"])
 
-# === OVERVIEW TAB WITH INSTRUCTIONS ===
 with tab1:
     st.markdown("""
     <div class="card">
         <h3>How to Use Paymeter Pro</h3>
         <ol>
             <li><strong>Upload Required Files</strong>: <code>paymeter_report.csv</code> and <code>Eko Trans.csv</code></li>
-            <li><strong>Optional Files</strong>: Upload or use defaults in <code>data/</code> folder:
-                <ul>
-                    <li><code>district.csv</code> → Maps account to district</li>
-                    <li><code>KCG.csv</code> → List of KCG accounts</li>
-                    <li><code>district_acct_number.csv</code> → Extra info</li>
-                </ul>
-            </li>
-            <li><strong>Click "GENERATE REPORT"</strong> → Wait for magic</li>
-            <li><strong>Download</strong> the timestamped Excel with <strong>12+ sheets</strong></li>
+            <li><strong>Check Date Ranges</strong>: Click to view available dates</li>
+            <li><strong>Select Date Range</strong>: Choose dates within the detected range</li>
+            <li><strong>Click "GENERATE REPORT"</strong></li>
         </ol>
-        <p><strong>Tip</strong>: Test with small files first!</p>
+        <p><strong>Warning</strong>: Dates outside the data range will stop the report.</p>
     </div>
     """, unsafe_allow_html=True)
+
+    if st.session_state.dates_checked:
+        if st.session_state.pay_min and st.session_state.pay_max:
+            st.info(f"Paymeter Date Range: {st.session_state.pay_min} to {st.session_state.pay_max}")
+        else:
+            st.warning("No 'Created At' column found in Paymeter report or invalid dates.")
+        if st.session_state.eko_min and st.session_state.eko_max:
+            st.info(f"Eko Date Range: {st.session_state.eko_min} to {st.session_state.eko_max}")
+        else:
+            st.warning("No 'Transaction Date' column found in Eko report or invalid dates.")
 
     col1, col2, col3 = st.columns(3)
     m1 = col1.empty()
@@ -713,9 +803,50 @@ with tab2: preview_area = st.empty()
 with tab3: results_area = st.empty()
 with tab4: log_area = st.empty()
 
+# === CHECK DATE RANGES ===
+if check_dates:
+    if not paymeter_file or not eko_file:
+        st.error("Please upload both required CSV files.")
+    else:
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            paymeter_path = Path(tmpdirname) / "paymeter_report.csv"
+            eko_path = Path(tmpdirname) / "eko_trans.csv"
+            with open(paymeter_path, "wb") as f: f.write(paymeter_file.getbuffer())
+            with open(eko_path, "wb") as f: f.write(eko_file.getbuffer())
+
+            pay_df = safe_read_csv(paymeter_path)
+            eko_df = safe_read_csv(eko_path)
+
+            # Paymeter dates
+            try:
+                pay_dates = pd.to_datetime(pay_df['Created At'], errors='coerce').dropna()
+                if not pay_dates.empty:
+                    st.session_state.pay_min = pay_dates.min().date()
+                    st.session_state.pay_max = pay_dates.max().date()
+                else:
+                    st.session_state.pay_min = st.session_state.pay_max = None
+            except KeyError:
+                st.session_state.pay_min = st.session_state.pay_max = None
+
+            # Eko dates
+            try:
+                eko_dates = pd.to_datetime(eko_df['Transaction Date'], errors='coerce').dropna()
+                if not eko_dates.empty:
+                    st.session_state.eko_min = eko_dates.min().date()
+                    st.session_state.eko_max = eko_dates.max().date()
+                else:
+                    st.session_state.eko_min = st.session_state.eko_max = None
+            except KeyError:
+                st.session_state.eko_min = st.session_state.eko_max = None
+
+            st.session_state.dates_checked = True
+            st.rerun()
+
 # === RUN PIPELINE ===
 if run:
-    if not paymeter_file or not eko_file:
+    if not st.session_state.dates_checked:
+        st.error("Please check date ranges first.")
+    elif not paymeter_file or not eko_file:
         st.error("Please upload both required CSV files.")
     else:
         work_dir = Path(tempfile.mkdtemp(prefix="paymeter_"))
@@ -746,12 +877,12 @@ if run:
                 district_info_path = work_dir / "district_info.csv"
                 with open(district_info_path, "wb") as f: f.write(district_info_upload.getbuffer())
 
-            # Step 1
+            # Step 1: Clean all records
             with st.spinner("Repairing address spills..."):
                 cleaned = work_dir / "cleaned.csv"
                 fixed_count, examples = repair_address_spill(str(paymeter_path), str(cleaned), preview_limit=preview_limit)
 
-            # Step 2
+            # Step 2: Merge districts
             with st.spinner("Merging district data..."):
                 bydistrict = work_dir / "bydistrict.csv"
                 if district_path:
@@ -759,19 +890,77 @@ if run:
                 else:
                     shutil.copy2(cleaned, bydistrict)
 
-            # Step 3
+            # Load cleaned data
+            trans_df = safe_read_csv(bydistrict)
+            eko_df   = safe_read_csv(eko_path)
+
+            # Parse dates
+            if 'Created At' in trans_df.columns:
+                trans_df['Created At'] = pd.to_datetime(trans_df['Created At'], errors='coerce')
+            if 'Transaction Date' in eko_df.columns:
+                eko_df['Transaction Date'] = pd.to_datetime(eko_df['Transaction Date'], errors='coerce')
+
+            # === VALIDATE DATE RANGE ===
+            start_date, end_date = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (None, None)
+            if start_date and end_date:
+                start_ts = pd.Timestamp(start_date)
+                end_ts   = pd.Timestamp(end_date)
+
+                pay_min = pd.Timestamp(st.session_state.pay_min) if st.session_state.pay_min else None
+                pay_max = pd.Timestamp(st.session_state.pay_max) if st.session_state.pay_max else None
+                eko_min = pd.Timestamp(st.session_state.eko_min) if st.session_state.eko_min else None
+                eko_max = pd.Timestamp(st.session_state.eko_max) if st.session_state.eko_max else None
+
+                errors = []
+                if pay_min and pay_max:
+                    if start_ts < pay_min:
+                        errors.append(f"Start date ({start_date}) is before Paymeter data starts ({pay_min.date()})")
+                    if end_ts > pay_max:
+                        errors.append(f"End date ({end_date}) is after Paymeter data ends ({pay_max.date()})")
+                if eko_min and eko_max:
+                    if start_ts < eko_min:
+                        errors.append(f"Start date ({start_date}) is before Eko data starts ({eko_min.date()})")
+                    if end_ts > eko_max:
+                        errors.append(f"End date ({end_date}) is after Eko data ends ({eko_max.date()})")
+
+                if errors:
+                    st.error("**Invalid Date Range Selected**")
+                    for err in errors:
+                        st.warning(f"Warning: {err}")
+                    st.stop()
+
+                # === APPLY FILTER ===
+                with st.spinner("Filtering data by selected date range..."):
+                    def _date_floor(s):
+                        return pd.to_datetime(s).dt.floor('D')
+
+                    if 'Created At' in trans_df.columns:
+                        trans_mask = (_date_floor(trans_df['Created At']) >= start_ts) & (_date_floor(trans_df['Created At']) <= end_ts)
+                        trans_df = trans_df[trans_mask]
+
+                    if 'Transaction Date' in eko_df.columns:
+                        eko_mask = (_date_floor(eko_df['Transaction Date']) >= start_ts) & (_date_floor(eko_df['Transaction Date']) <= end_ts)
+                        eko_df = eko_df[eko_mask]
+
+            # Save filtered
+            filtered_trans = work_dir / "filtered_trans.csv"
+            filtered_eko = work_dir / "filtered_eko.csv"
+            trans_df.to_csv(filtered_trans, index=False)
+            eko_df.to_csv(filtered_eko, index=False)
+
+            # Step 3: Generate report
             with st.spinner("Generating final report..."):
                 out_detail = work_dir / "detail.csv"
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 out_excel = work_dir / f"PaymeterReport_{timestamp}.xlsx"
                 result = merge_and_analyze(
-                    str(eko_path), str(bydistrict),
+                    str(filtered_eko), str(filtered_trans),
                     str(district_info_path) if district_info_path else None,
                     str(kcg_path) if kcg_path else None,
                     str(out_detail), str(out_excel)
                 )
 
-            detail_df = pd.read_csv(out_detail, dtype=str, keep_default_na=False)
+            detail_df = safe_read_csv(Path(out_detail))
             txn_sum = pd.to_numeric(detail_df['Transaction Amount'].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0).sum()
 
             # === UPDATE UI ===
@@ -796,9 +985,9 @@ if run:
                 c1, c2 = st.columns(2)
                 with c1:
                     with open(cleaned, "rb") as f:
-                        st.download_button("Cleaned Paymeter", f.read(), "cleaned.csv", "text/csv")
+                        st.download_button("Cleaned Paymeter (Full)", f.read(), "cleaned.csv", "text/csv")
                     with open(out_detail, "rb") as f:
-                        st.download_button("Detailed Merged", f.read(), "detail.csv", "text/csv")
+                        st.download_button("Detailed Merged (Filtered)", f.read(), "detail.csv", "text/csv")
                 with c2:
                     with open(out_excel, "rb") as f:
                         st.download_button(
