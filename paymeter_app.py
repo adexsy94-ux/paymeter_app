@@ -29,11 +29,10 @@ DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
 LOGO_PATH = DATA_DIR / "Logo.png"
 
-# === EMBEDDED LOGO (Base64) - REPLACE WITH YOUR LOGO ===
-# Generate at: https://www.base64-image.de/
+# === YOUR LOGO – Base64 (you just gave me) ===
 EMBEDDED_LOGO_BASE64 = """
-iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHVVAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibcAAAABl0RVh0U29...
-"""  # ← PASTE YOUR FULL BASE64 STRING HERE (after the comma)
+iVBORw0KGgoAAAANSUhEUgAAAi4AAAIuCAYAAACYSoPfAAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAAXNSR0IArs4c6QAAAARzQklUCAgICHwIZIgAACAASURBVHic7N17fFzVeS/837rstWeksR2MADPiMgSi1I3SksQkxqTCnDjkQNy8J8RJfHoh9DRxb5ymb9ombZP0lqSnyWlJcyhNDiRNIDdwuQbHIWCDcUAGjIPBosYCB2GD7NiyQdJoZvbe63L+WHuPrAHHYFsajfR8+ezPeO57hLT3M8961rMYCCGz1mq3o3MUo10apmN/9SCE
+"""  # ← **YOUR LOGO** – keep the whole string, no extra spaces
 
 # ----------------------------------------------------------------------
 # Helper: robust CSV reader
@@ -595,7 +594,7 @@ def merge_and_analyze(
 
 st.set_page_config(page_title="Paymeter Pro", layout="wide", page_icon="lightning")
 
-# === CUSTOM CSS (Fully Responsive + Mobile Fix) ===
+# === CUSTOM CSS (Fully Responsive + Code/Mobile Fixes) ===
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -706,6 +705,24 @@ st.markdown("""
         .card h3, .card p, .card li, .card code, .card ol {
             color: #212529 !important;
         }
+        /* FIX: Code blocks (e.g., paymeter_report.csv) visible on mobile */
+        code, .st-emotion-cache-1trjexit code, [data-testid="stMarkdownContainer"] code {
+            background-color: #f8f9fa !important;
+            color: #000000 !important;
+            border: 1px solid #e9ecef !important;
+            padding: 0.2rem 0.4rem !important;
+            border-radius: 4px !important;
+            font-size: 0.9em !important;
+        }
+    }
+
+    /* Global fix for code blocks (big screens too) */
+    code, [data-testid="stMarkdownContainer"] code {
+        background-color: #f8f9fa !important;
+        color: #000000 !important;
+        border: 1px solid #e9ecef !important;
+        padding: 0.2rem 0.4rem !important;
+        border-radius: 4px !important;
     }
 </style>
 """, unsafe_allow_html=True)
