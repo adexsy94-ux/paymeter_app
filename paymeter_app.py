@@ -29,8 +29,8 @@ DEFAULT_KCG = DATA_DIR / "KCG.csv"
 DEFAULT_DISTRICT_INFO = DATA_DIR / "district_acct_number.csv"
 LOGO_PATH = DATA_DIR / "Logo.png"
 
-# === EMBEDDED LOGO (Base64) - REPLACE THIS WITH YOUR LOGO ===
-# How to generate: https://www.base64-image.de/ → Upload Logo.png → Copy base64 string
+# === EMBEDDED LOGO (Base64) - REPLACE WITH YOUR LOGO ===
+# Generate at: https://www.base64-image.de/
 EMBEDDED_LOGO_BASE64 = """
 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHVVAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibcAAAABl0RVh0U29...
 """  # ← PASTE YOUR FULL BASE64 STRING HERE (after the comma)
@@ -595,7 +595,7 @@ def merge_and_analyze(
 
 st.set_page_config(page_title="Paymeter Pro", layout="wide", page_icon="lightning")
 
-# === CUSTOM CSS (Responsive) ===
+# === CUSTOM CSS (Fully Responsive + Mobile Fix) ===
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
@@ -676,7 +676,7 @@ st.markdown("""
         color: white;
     }
 
-    /* Responsive */
+    /* FIX: Readable text on small screens */
     @media (max-width: 768px) {
         .header-container {
             flex-direction: column;
@@ -698,6 +698,14 @@ st.markdown("""
             font-size: 1.4rem !important;
             padding: 1rem 2rem !important;
         }
+        .card {
+            background: #ffffff !important;
+            color: #212529 !important;
+            border: 1px solid #dee2e6 !important;
+        }
+        .card h3, .card p, .card li, .card code, .card ol {
+            color: #212529 !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -716,7 +724,7 @@ if LOGO_PATH.exists():
         logo_status = f"File error: {e}"
 else:
     logo_src = f"data:image/png;base64,{EMBEDDED_LOGO_BASE64.strip()}"
-    logo_status = "Logo: Using embedded version (file not found)"
+    logo_status = "Logo: Using embedded version"
 
 st.markdown(f"""
 <div class="header-container">
