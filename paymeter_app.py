@@ -623,7 +623,10 @@ st.markdown("""
     }
     .header-text {
         flex: 1;
-        text-align: left;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        text-align: center;
     }
     .header-title {font-size: 2.8rem; font-weight: 700; margin: 0;}
     .header-subtitle {font-size: 1.1rem; opacity: 0.9; margin-top: 0.5rem;}
