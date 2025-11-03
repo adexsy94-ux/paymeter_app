@@ -421,6 +421,16 @@ def merge_and_analyze(
     else:
         non_kcg_ranges = pd.DataFrame(columns=['Amount_Range','Transaction_Count','Total_Amount','Total_Commission'])
 
+    if not kcg_rows.empty:
+        kcg_rows = kcg_rows.assign(Amount_Range=pd.cut(kcg_rows['Transaction Amount'], bins=bins, labels=labels, right=True))
+        kcg_ranges = kcg_rows.groupby('Amount_Range', observed=False).agg(
+            Transaction_Count=('Transaction Amount', 'size'),
+            Total_Amount=('Transaction Amount', 'sum'),
+            Total_Commission=('commission', 'sum')
+        ).reset_index()
+    else:
+        kcg_ranges = pd.DataFrame(columns=['Amount_Range','Transaction_Count','Total_Amount','Total_Commission'])
+
     account_col_candidates = [c for c in merged.columns if 'account' in c.lower()]
     acct_col = account_col_candidates[0] if account_col_candidates else 'Account Number_trans'
     if acct_col not in merged.columns:
@@ -517,14 +527,33 @@ def merge_and_analyze(
     report = pd.DataFrame(merged['District'].unique(), columns=['District'])
     district_trans_totals = merged.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'paymeter_total'})
     district_eko_totals = merged.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'eko_total'})
-    district_commission = merged.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'district_commission'})
+    district_commission = merged.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'total_commission'})
+
+    district_kcg_trans = kcg_rows.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'kcg_paymeter_total'})
+    district_kcg_eko = kcg_rows.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'kcg_eko_total'})
+    district_kcg_comm = kcg_rows.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'kcg_commission'})
+
+    district_non_kcg_trans = non_kcg_rows.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'non_kcg_paymeter_total'})
+    district_non_kcg_eko = non_kcg_rows.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'non_kcg_eko_total'})
+    district_non_kcg_comm = non_kcg_rows.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'non_kcg_commission'})
+
     report = report.merge(district_trans_totals, on='District', how='left')\
                    .merge(district_eko_totals, on='District', how='left')\
-                   .merge(district_commission, on='District', how='left')
-    for c in ['paymeter_total','eko_total','district_commission']:
+                   .merge(district_commission, on='District', how='left')\
+                   .merge(district_kcg_trans, on='District', how='left')\
+                   .merge(district_kcg_eko, on='District', how='left')\
+                   .merge(district_kcg_comm, on='District', how='left')\
+                   .merge(district_non_kcg_trans, on='District', how='left')\
+                   .merge(district_non_kcg_eko, on='District', how='left')\
+                   .merge(district_non_kcg_comm, on='District', how='left')
+
+    report['difference'] = report['eko_total'] - report['paymeter_total']
+    report['kcg_difference'] = report['kcg_eko_total'] - report['kcg_paymeter_total']
+    report['non_kcg_difference'] = report['non_kcg_eko_total'] - report['non_kcg_paymeter_total']
+
+    for c in ['paymeter_total','eko_total','total_commission','kcg_paymeter_total','kcg_eko_total','kcg_commission','non_kcg_paymeter_total','non_kcg_eko_total','non_kcg_commission']:
         if c in report.columns:
             report[c] = report[c].fillna(0.0)
-    report['difference'] = report['eko_total'] - report['paymeter_total']
 
     if district_info_path and os.path.exists(district_info_path):
         try:
@@ -552,6 +581,7 @@ def merge_and_analyze(
     top20 = make_columns_unique(top20)
     main_summary = make_columns_unique(main_summary)
     non_kcg_ranges = make_columns_unique(non_kcg_ranges)
+    kcg_ranges = make_columns_unique(kcg_ranges)
     scenario_no_kcg = make_columns_unique(scenario_no_kcg)
     monthly_non_kcg = make_columns_unique(monthly_non_kcg)
     monthly_kcg = make_columns_unique(monthly_kcg)
@@ -564,6 +594,7 @@ def merge_and_analyze(
         with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
             main_summary.to_excel(writer, sheet_name="Main Summary", index=False)
             non_kcg_ranges.to_excel(writer, sheet_name="Non-KCG Ranges", index=False)
+            kcg_ranges.to_excel(writer, sheet_name="KCG Ranges", index=False)
             account_summary.to_excel(writer, sheet_name="All Accounts Summary", index=False)
             top20.to_excel(writer, sheet_name="Top 20 Accounts", index=False)
             scenario_no_kcg.to_excel(writer, sheet_name="Scenario No KCG", index=False)
