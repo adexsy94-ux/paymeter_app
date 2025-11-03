@@ -1,3 +1,4 @@
+
 # paymeter_app.py
 # -*- coding: utf-8 -*-
 """
@@ -121,15 +122,16 @@ def pick_kcg_column(df: pd.DataFrame) -> str:
         raise ValueError("KCG file has no columns")
     def score(c):
         lc = c.lower()
-        s = 0
-        if 'kcg' in lc: s += 100
-        if 'account' in lc: s += 50
-        if 'acct' in lc: s += 40
-        if 'number' in lc or 'no' in lc: s += 20
-        return s, -len(c)
-
-    best = max(cols, key=score)
-    return best
+        return (
+            ("kcg" in lc) * 4 + ("account" in lc) * 2 + ("number" in lc) * 1,
+            -len(c)
+        )
+    preferred = sorted(cols, key=score, reverse=True)
+    for c in preferred:
+        sample = df[c].astype(str).head(200).apply(normalize_acct)
+        if (sample.str.len() >= 6).mean() >= 0.5:
+            return c
+    return cols[0]
 
 # -----------------------------
 # Step A: Repair address spill
@@ -388,64 +390,93 @@ def merge_and_analyze(
 
     merged['Is_KCG'] = (matched_any | text_flag).fillna(False)
 
-    # === FIX: Set 'Created At' ONCE in merged, THEN split ===
-    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt', 'Transaction Date']
+    kcg_rows = merged.loc[merged['Is_KCG']].copy()
+    non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
+
+    main_summary = pd.DataFrame([
+        {"Category": "All Accounts", "Count": len(merged),
+         "Transaction Amount": merged['Transaction Amount'].sum(),
+         "Commission": merged['commission'].sum()},
+        {"Category": "KCG Accounts", "Count": len(kcg_rows),
+         "Transaction Amount": kcg_rows['Transaction Amount'].sum(),
+         "Commission": kcg_rows['commission'].sum()},
+        {"Category": "Non-KCG Accounts", "Count": len(non_kcg_rows),
+         "Transaction Amount": non_kcg_rows['Transaction Amount'].sum(),
+         "Commission": non_kcg_rows['commission'].sum()}
+    ])
+
+    bins = [0, 10000, 20000, 40000, 60000, 80000, 100000, 200000, 300000, 500000, 1000000, float("inf")]
+    labels = [
+        "0 - 10,000", "10,001 - 20,000", "20,001 - 40,000", "40,001 - 60,000",
+        "60,001 - 80,000", "80,001 - 100,000", "100,001 - 200,000",
+        "200,001 - 300,000", "300,001 - 500,000", "500,001 - 1,000,000",
+        "1,000,001 and above"
+    ]
+    if not non_kcg_rows.empty:
+        non_kcg_rows = non_kcg_rows.assign(Amount_Range=pd.cut(non_kcg_rows['Transaction Amount'], bins=bins, labels=labels, right=True))
+        non_kcg_ranges = non_kcg_rows.groupby('Amount_Range', observed=False).agg(
+            Transaction_Count=('Transaction Amount', 'size'),
+            Total_Amount=('Transaction Amount', 'sum'),
+            Total_Commission=('commission', 'sum')
+        ).reset_index()
+    else:
+        non_kcg_ranges = pd.DataFrame(columns=['Amount_Range','Transaction_Count','Total_Amount','Total_Commission'])
+
+    account_col_candidates = [c for c in merged.columns if 'account' in c.lower()]
+    acct_col = account_col_candidates[0] if account_col_candidates else 'Account Number_trans'
+    if acct_col not in merged.columns:
+        merged[acct_col] = merged.get('Account Number_trans', merged.index.astype(str))
+    merged[acct_col] = merged[acct_col].astype(str).apply(normalize_acct)
+
+    cust_col = None
+    for c in ['Customer Name', 'CustomerName', 'Name', 'Customer']:
+        if c in merged.columns:
+            cust_col = c
+            break
+    if cust_col is None:
+        merged['Customer Name'] = merged.get('Customer Name', '')
+        cust_col = 'Customer Name'
+
+    account_summary = merged.groupby([acct_col, cust_col], as_index=False).agg(
+        Transaction_Count=('Transaction Amount','size'),
+        Total_Amount=('Transaction Amount','sum'),
+        Total_Commission=('commission','sum')
+    )
+
+    top20 = account_summary.sort_values(by=['Transaction_Count','Total_Amount'], ascending=[False, False]).head(20)
+
+    scenario_no_kcg = pd.DataFrame([{
+        "Category": "Scenario: Non-KCG Only",
+        "Count": len(non_kcg_rows),
+        "Transaction Amount": non_kcg_rows['Transaction Amount'].sum(),
+        "Commission": non_kcg_rows['commission'].sum()
+    }])
+
+    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt']
     created_col = None
     for c in created_candidates:
         if c in merged.columns:
             created_col = c
             break
-
     if created_col:
         merged['Created At'] = pd.to_datetime(merged[created_col], errors='coerce')
+        kcg_rows['Created At'] = pd.to_datetime(kcg_rows.get(created_col, kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
+        non_kcg_rows['Created At'] = pd.to_datetime(non_kcg_rows.get(created_col, non_kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
     else:
-        # Fallback: try Transaction Date from eko
-        if 'Transaction Date' in merged.columns:
-            merged['Created At'] = pd.to_datetime(merged['Transaction Date'], errors='coerce')
-        else:
-            merged['Created At'] = pd.NaT
+        merged['Created At'] = pd.NaT
+        kcg_rows['Created At'] = pd.NaT
+        non_kcg_rows['Created At'] = pd.NaT
 
-    # === NOW SPLIT AFTER DATE IS SET ===
-    kcg_rows = merged.loc[merged['Is_KCG']].copy()
-    non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
-
-    # === DEBUG LOGGING ===
-    debug_lines = [
-        f"KCG Detection: {len(kcg_rows)} rows marked as KCG",
-        f"Non-KCG: {len(non_kcg_rows)} rows",
-        f"Created At column used: {created_col or 'None'}",
-        f"Created At nulls in merged: {merged['Created At'].isna().sum()}",
-        f"Created At nulls in kcg_rows: {kcg_rows['Created At'].isna().sum()}"
-    ]
-
-    # === SAFE MONTHLY KCG ===
-    if not kcg_rows.empty and kcg_rows['Created At'].notna().any():
-        kcg_rows = kcg_rows.copy()
-        kcg_rows['Month'] = kcg_rows['Created At'].dt.to_period('M')
-        monthly_kcg = kcg_rows.groupby('Month', observed=False).agg(
-            Count=('Transaction Amount', 'size'),
-            Transaction_Amount=('Transaction Amount', 'sum'),
-            Commission=('commission', 'sum')
-        ).reset_index()
-        monthly_kcg = monthly_kcg.sort_values('Month').reset_index(drop=True)
-        debug_lines.append(f"Monthly KCG: {len(monthly_kcg)} months with data")
-    else:
-        monthly_kcg = pd.DataFrame(columns=['Month', 'Count', 'Transaction_Amount', 'Commission'])
-        debug_lines.append("Monthly KCG: EMPTY (no valid dates)")
-
-    # === SAFE MONTHLY NON-KCG ===
-    if not non_kcg_rows.empty and non_kcg_rows['Created At'].notna().any():
-        non_kcg_rows = non_kcg_rows.copy()
-        non_kcg_rows['Month'] = non_kcg_rows['Created At'].dt.to_period('M')
-        monthly_non_kcg = non_kcg_rows.groupby('Month', observed=False).agg(
-            Count=('Transaction Amount', 'size'),
-            Transaction_Amount=('Transaction Amount', 'sum'),
-            Commission=('commission', 'sum')
-        ).reset_index()
-        monthly_non_kcg = monthly_non_kcg.sort_values('Month').reset_index(drop=True)
-    else:
-        monthly_non_kcg = pd.DataFrame(columns=['Month', 'Count', 'Transaction_Amount', 'Commission'])
-
+    monthly_non_kcg = non_kcg_rows.assign(Month=non_kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
+        Count=('Transaction Amount','size'),
+        Transaction_Amount=('Transaction Amount','sum'),
+        Commission=('commission','sum')
+    ).reset_index()
+    monthly_kcg = kcg_rows.assign(Month=kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
+        Count=('Transaction Amount','size'),
+        Transaction_Amount=('Transaction Amount','sum'),
+        Commission=('commission','sum')
+    ).reset_index()
     monthly_all = merged.assign(Month=merged['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
         All_Count=('Transaction Amount','size'),
         All_Transaction_Amount=('Transaction Amount','sum'),
@@ -554,8 +585,7 @@ def merge_and_analyze(
         "monthly_trends_combined": monthly_trends_combined,
         "top20": top20,
         "out_detail": out_detail,
-        "out_excel": out_excel,
-        "debug_kcg": debug_lines
+        "out_excel": out_excel
     })
     return result
 
@@ -1008,11 +1038,6 @@ if run:
 
             with tab4:
                 log_area.code(f"Fixed: {fixed_count}\nDetail: {out_detail}\nExcel: {out_excel}")
-
-                if 'debug_kcg' in result:
-                    st.subheader("KCG Debug Log")
-                    for line in result['debug_kcg']:
-                        st.write(f"• {line}")
 
         except Exception as e:
             st.error(f"Error: {e}")
