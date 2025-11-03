@@ -461,7 +461,7 @@ def merge_and_analyze(
         "Commission": non_kcg_rows['commission'].sum()
     }])
 
-    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt']
+    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt', 'Transaction Date', 'Transaction_Date', 'transactiondate', 'transaction_date']
     created_col = None
     for c in created_candidates:
         if c in merged.columns:
@@ -469,12 +469,17 @@ def merge_and_analyze(
             break
     if created_col:
         merged['Created At'] = pd.to_datetime(merged[created_col], errors='coerce')
-        kcg_rows['Created At'] = pd.to_datetime(kcg_rows.get(created_col, kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
-        non_kcg_rows['Created At'] = pd.to_datetime(non_kcg_rows.get(created_col, non_kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
+        if created_col != 'Created At' and 'Created At' in merged.columns:
+            merged['Created At'] = merged['Created At'].combine_first(pd.to_datetime(merged[created_col], errors='coerce'))
+        if 'Transaction Date' in merged.columns:
+            merged['Created At'] = merged['Created At'].combine_first(pd.to_datetime(merged['Transaction Date'], errors='coerce'))
     else:
         merged['Created At'] = pd.NaT
-        kcg_rows['Created At'] = pd.NaT
-        non_kcg_rows['Created At'] = pd.NaT
+        if 'Transaction Date' in merged.columns:
+            merged['Created At'] = pd.to_datetime(merged['Transaction Date'], errors='coerce')
+
+    kcg_rows['Created At'] = merged.loc[merged['Is_KCG'], 'Created At']
+    non_kcg_rows['Created At'] = merged.loc[~merged['Is_KCG'], 'Created At']
 
     monthly_non_kcg = non_kcg_rows.assign(Month=non_kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
         Count=('Transaction Amount','size'),
@@ -898,7 +903,9 @@ if check_dates:
             eko_df = safe_read_csv(eko_path)
 
             try:
-                pay_dates = pd.to_datetime(pay_df['Created At'], errors='coerce').dropna()
+                pay_dates = pd.to_datetime(pay_df.get('Created At', pd.Series(dtype=str)), errors='coerce').dropna()
+                if pay_dates.empty and 'Created At' not in pay_df.columns:
+                    pay_dates = pd.to_datetime(pay_df.get('Transaction Date', pd.Series(dtype=str)), errors='coerce').dropna()
                 if not pay_dates.empty:
                     st.session_state.pay_min = pay_dates.min().date()
                     st.session_state.pay_max = pay_dates.max().date()
@@ -908,7 +915,9 @@ if check_dates:
                 st.session_state.pay_min = st.session_state.pay_max = None
 
             try:
-                eko_dates = pd.to_datetime(eko_df['Transaction Date'], errors='coerce').dropna()
+                eko_dates = pd.to_datetime(eko_df.get('Transaction Date', pd.Series(dtype=str)), errors='coerce').dropna()
+                if eko_dates.empty and 'Transaction Date' not in eko_df.columns:
+                    eko_dates = pd.to_datetime(eko_df.get('Created At', pd.Series(dtype=str)), errors='coerce').dropna()
                 if not eko_dates.empty:
                     st.session_state.eko_min = eko_dates.min().date()
                     st.session_state.eko_max = eko_dates.max().date()
@@ -970,8 +979,12 @@ if run:
 
             if 'Created At' in trans_df.columns:
                 trans_df['Created At'] = pd.to_datetime(trans_df['Created At'], errors='coerce')
+            elif 'Transaction Date' in trans_df.columns:
+                trans_df['Created At'] = pd.to_datetime(trans_df['Transaction Date'], errors='coerce')
             if 'Transaction Date' in eko_df.columns:
                 eko_df['Transaction Date'] = pd.to_datetime(eko_df['Transaction Date'], errors='coerce')
+            elif 'Created At' in eko_df.columns:
+                eko_df['Transaction Date'] = pd.to_datetime(eko_df['Created At'], errors='coerce')
 
             start_date, end_date = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (None, None)
             if start_date and end_date:
