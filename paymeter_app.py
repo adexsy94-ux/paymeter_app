@@ -295,6 +295,7 @@ def merge_and_analyze(
     out_detail: str,
     out_excel: str
 ) -> Dict[str, Any]:
+    import difflib
     result: Dict[str, Any] = {}
     eko   = safe_read_csv(Path(eko_path))
     trans = safe_read_csv(Path(trans_path))
@@ -329,7 +330,7 @@ def merge_and_analyze(
     src_col = next((c for c in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT'] if c in merged.columns and merged[c].notna().any()), None)
     merged['District'] = merged[src_col].astype(str).replace({'nan': None}).fillna('empty').astype(str).str.strip() if src_col else 'empty'
 
-    # --- Amount detection (existing logic) ---
+    # --- Amount detection ---
     def pick_amount(col_list):
         for c in col_list:
             if c in merged.columns:
@@ -367,7 +368,6 @@ def merge_and_analyze(
         if 'account' in lc or 'acct' in lc or 'accountnumber' in lc.replace(' ',''):
             candidate_account_columns.append(c)
         else:
-            # sample some values and if many contain digits consider it
             try:
                 sample = merged[c].astype(str).head(100).str.replace(r'\D','',regex=True)
                 if sample.str.len().ge(4).mean() >= 0.3:
@@ -388,24 +388,19 @@ def merge_and_analyze(
     def try_match(norm_val: str):
         if not norm_val:
             return (None, None)
-        # exact
         if norm_val in kcg_set:
             return (norm_val, "exact")
-        # suffix/endswith
         for k in kcg_list:
             if k and (norm_val.endswith(k) or k.endswith(norm_val)):
                 return (k, "suffix")
-        # last6
         x6 = norm_val[-6:] if len(norm_val) >= 6 else norm_val
         for k in kcg_list:
             if k and (k.endswith(x6) or x6.endswith(k[-6:])):
                 return (k, "last6")
-        # last4
         x4 = norm_val[-4:] if len(norm_val) >= 4 else norm_val
         for k in kcg_list:
             if k and (k.endswith(x4) or x4.endswith(k[-4:])):
                 return (k, "last4")
-        # substring (permissive)
         for k in kcg_list:
             if k and (k in norm_val or norm_val in k):
                 return (k, "substring")
@@ -571,95 +566,146 @@ def merge_and_analyze(
     report['difference'] = report['eko_total'] - report['paymeter_total']
     report['kcg_share_pct'] = report.apply(lambda r: (r['kcg_paymeter_total']/r['paymeter_total']*100.0) if r['paymeter_total'] else 0.0, axis=1)
 
-    # --- Build DistrictSummaryTotal: include bank details from district_info if present ---
-    # Prepare default empty bank columns
+    # --- Build DistrictSummaryTotal: VLOOKUP District -> district_account_number.csv ---
     district_summary_total = report[['District','paymeter_total','eko_total','district_commission','difference']].copy()
     district_summary_total['Bank name'] = ""
     district_summary_total['Bank acct name'] = ""
     district_summary_total['Bank acct number'] = ""
 
-    # Try to load district_info (either provided path or DEFAULT)
+    # determine district_account file: prefer provided path, else try DEFAULT_DISTRICT_INFO, else try 'district_account_number.csv'
     district_info_df = None
+    candidates = []
     if district_info_path and os.path.exists(district_info_path):
+        candidates.append(district_info_path)
+    if DEFAULT_DISTRICT_INFO.exists():
+        candidates.append(str(DEFAULT_DISTRICT_INFO))
+    # also accept the common alternative name user mentioned
+    alt = Path(BASE_DIR) / "district_account_number.csv"
+    if alt.exists():
+        candidates.append(str(alt))
+
+    for cand in candidates:
         try:
-            district_info_df = safe_read_csv(Path(district_info_path))
-        except Exception:
-            district_info_df = None
-    elif DEFAULT_DISTRICT_INFO.exists():
-        try:
-            district_info_df = safe_read_csv(DEFAULT_DISTRICT_INFO)
+            district_info_df = safe_read_csv(Path(cand))
+            if district_info_df is not None and not district_info_df.empty:
+                break
         except Exception:
             district_info_df = None
 
     if district_info_df is not None and not district_info_df.empty:
-        # normalize district column name
+        # detect district/key column in district_info_df
         district_col = None
         for c in district_info_df.columns:
-            if c.lower() in ('district','districtname','district_name','area'):
+            if c.lower().strip() in ('district','districtname','district_name','area','area_name','location'):
                 district_col = c
                 break
-        if not district_col:
-            # try find a column whose values match districts
+        if district_col is None:
+            # fallback: choose the column with the largest number of unique text values
+            cand_scores = []
             for c in district_info_df.columns:
-                sample = district_info_df[c].astype(str).head(50)
-                if sample.str.strip().str.len().gt(0).any():
-                    # no strong guarantee — just pick the first non-empty column as district fallback
-                    district_col = c
-                    break
+                try:
+                    vals = district_info_df[c].astype(str).str.strip()
+                    cand_scores.append((c, vals[vals != ""].nunique()))
+                except Exception:
+                    cand_scores.append((c, 0))
+            cand_scores.sort(key=lambda x: x[1], reverse=True)
+            district_col = cand_scores[0][0] if cand_scores else district_info_df.columns[0]
 
-        # detect bank columns heuristically
+        # find bank columns heuristically
         bank_name_col = None
         bank_acct_name_col = None
         bank_acct_num_col = None
         for c in district_info_df.columns:
             lc = c.lower().replace(' ','').replace('_','')
-            if bank_name_col is None and any(k in lc for k in ('bankname','bank','bankname2','bankbranch')):
+            if bank_name_col is None and any(k in lc for k in ('bankname','bank','bankbranch')):
                 bank_name_col = c
-            if bank_acct_name_col is None and any(k in lc for k in ('accountname','acctname','beneficiary','beneficiaryname','accountname1','acctname1')):
+            if bank_acct_name_col is None and any(k in lc for k in ('accountname','acctname','beneficiary','beneficiaryname','acctname')):
                 bank_acct_name_col = c
-            if bank_acct_num_col is None and any(k in lc for k in ('accountnumber','acctnumber','acctno','accountno','account_number','acctnum')):
+            if bank_acct_num_col is None and any(k in lc for k in ('accountnumber','acctnumber','acctno','accountno','account_number','acctnum','acctno')):
                 bank_acct_num_col = c
 
-        # normalize/rename to join
-        join_df = district_info_df.copy()
-        # ensure district_col exists
-        if district_col is None:
-            # nothing sensible to join on; attempt best-effort: if there's a column named 'district' in report, skip join
-            district_col = None
-        else:
-            join_df = join_df[[c for c in [district_col, bank_name_col, bank_acct_name_col, bank_acct_num_col] if c in join_df.columns]]
-            join_df = join_df.rename(columns={
-                district_col: 'District',
-                bank_name_col or '': 'Bank name' if bank_name_col else bank_name_col,
-                bank_acct_name_col or '': 'Bank acct name' if bank_acct_name_col else bank_acct_name_col,
-                bank_acct_num_col or '': 'Bank acct number' if bank_acct_num_col else bank_acct_num_col
-            })
-            # Clean columns: keep only those present
-            cols_to_keep = [c for c in ['District','Bank name','Bank acct name','Bank acct number'] if c in join_df.columns]
-            join_df = join_df[cols_to_keep]
-            # Normalize District values
-            join_df['District'] = join_df['District'].astype(str).str.strip()
+        # normalize function for district keys
+        def norm_text(s):
+            return re.sub(r'[^a-z0-9]+','', str(s or '').lower()).strip()
 
-            # Merge into district_summary_total on District
-            district_summary_total = district_summary_total.merge(join_df, on='District', how='left')
-            # If merge left duplicates existing columns, ensure final column names exist
-            for col in ['Bank name','Bank acct name','Bank acct number']:
-                if col not in district_summary_total.columns:
-                    district_summary_total[col] = ""
-            # Fill NaNs with empty strings
-            for col in ['Bank name','Bank acct name','Bank acct number']:
-                district_summary_total[col] = district_summary_total[col].fillna("")
+        # prepare normalized lookup table
+        info = district_info_df.copy()
+        info['__district_raw__'] = info[district_col].astype(str)
+        info['district_norm'] = info['__district_raw__'].apply(norm_text)
+        info = info.drop_duplicates(subset=['district_norm'], keep='first').set_index('district_norm')
+
+        # normalized district in summary
+        district_summary_total['district_norm'] = district_summary_total['District'].astype(str).apply(norm_text)
+
+        # perform exact normalized join first
+        def _get_info_for_norm(n):
+            if n in info.index:
+                row = info.loc[n]
+                return {
+                    "Bank name": row.get(bank_name_col, "") if bank_name_col in row.index else row.get('Bank name', ""),
+                    "Bank acct name": row.get(bank_acct_name_col, "") if bank_acct_name_col in row.index else row.get('Bank acct name', ""),
+                    "Bank acct number": row.get(bank_acct_num_col, "") if bank_acct_num_col in row.index else row.get('Bank acct number', "")
+                }
+            return {"Bank name":"", "Bank acct name":"", "Bank acct number":""}
+
+        mapped_bank_name = []
+        mapped_bank_acct_name = []
+        mapped_bank_acct_num = []
+        match_log = []
+
+        info_keys = list(info.index)
+        for orig_d, dn in zip(district_summary_total['District'].astype(str), district_summary_total['district_norm'].astype(str)):
+            entry = _get_info_for_norm(dn)
+            match_type = "exact_norm" if entry["Bank name"] or entry["Bank acct number"] or entry["Bank acct name"] else ""
+            matched_to = ""
+            if not match_type:
+                # fuzzy attempt
+                if info_keys:
+                    candidate = difflib.get_close_matches(dn, info_keys, n=1, cutoff=0.75)
+                    if candidate:
+                        row = info.loc[candidate[0]]
+                        entry = {
+                            "Bank name": row.get(bank_name_col, "") if bank_name_col in row.index else row.get('Bank name', ""),
+                            "Bank acct name": row.get(bank_acct_name_col, "") if bank_acct_name_col in row.index else row.get('Bank acct name', ""),
+                            "Bank acct number": row.get(bank_acct_num_col, "") if bank_acct_num_col in row.index else row.get('Bank acct number', "")
+                        }
+                        match_type = "fuzzy"
+                        matched_to = info.loc[candidate[0]][district_col] if district_col in info.columns else candidate[0]
+            mapped_bank_name.append(str(entry.get("Bank name","") or ""))
+            mapped_bank_acct_name.append(str(entry.get("Bank acct name","") or ""))
+            mapped_bank_acct_num.append(str(entry.get("Bank acct number","") or ""))
+            match_log.append({
+                "District": orig_d,
+                "district_norm": dn,
+                "Matched_Bank_name": mapped_bank_name[-1],
+                "Matched_Bank_acct_name": mapped_bank_acct_name[-1],
+                "Matched_Bank_acct_number": mapped_bank_acct_num[-1],
+                "Match_Type": match_type,
+                "Matched_To": matched_to
+            })
+
+        district_summary_total['Bank name'] = mapped_bank_name
+        district_summary_total['Bank acct name'] = mapped_bank_acct_name
+        district_summary_total['Bank acct number'] = mapped_bank_acct_num
+
+        # cleanup helper
+        district_summary_total = district_summary_total.drop(columns=['district_norm'], errors='ignore')
+
+        # create match log dataframe
+        district_match_log = pd.DataFrame(match_log)
+
+    else:
+        # no district_info available: keep blank bank columns and empty match log
+        district_match_log = pd.DataFrame(columns=['District','district_norm','Matched_Bank_name','Matched_Bank_acct_name','Matched_Bank_acct_number','Match_Type','Matched_To'])
 
     # Ensure numeric and ordering
     for c in ['paymeter_total','eko_total','district_commission','difference']:
         if c in district_summary_total.columns:
             district_summary_total[c] = pd.to_numeric(district_summary_total[c], errors='coerce').fillna(0.0)
 
-    # Reorder columns exactly as requested
     desired_order = ['District','paymeter_total','eko_total','district_commission','difference','Bank name','Bank acct name','Bank acct number']
     for col in desired_order:
         if col not in district_summary_total.columns:
-            # create missing columns as blank
             district_summary_total[col] = "" if col.startswith('Bank') else 0.0
     district_summary_total = district_summary_total[desired_order]
 
@@ -707,6 +753,7 @@ def merge_and_analyze(
     debug_df = make_columns_unique(debug_df)
     kcg_summary = make_columns_unique(kcg_summary)
     district_summary_total = make_columns_unique(district_summary_total)
+    district_match_log = make_columns_unique(district_match_log)
 
     try:
         with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
@@ -719,11 +766,12 @@ def merge_and_analyze(
             monthly_kcg.to_excel(writer, sheet_name="Monthly KCG", index=False)
             monthly_trends_combined.to_excel(writer, sheet_name="Monthly Trends (All)", index=False)
             report.to_excel(writer, sheet_name="District Summary", index=False)
-            # new sheet
             district_summary_total.to_excel(writer, sheet_name="DistrictSummaryTotal", index=False)
             kcg_summary.to_excel(writer, sheet_name="KCG_Summary", index=False)
             if not debug_df.empty:
                 debug_df.to_excel(writer, sheet_name="KCG_Debug", index=False)
+            if not district_match_log.empty:
+                district_match_log.to_excel(writer, sheet_name="District_Match_Log", index=False)
             if not audit_df.empty:
                 audit_df.to_excel(writer, sheet_name="Audit Empty District", index=False)
             merged.to_csv(out_detail, index=False)
