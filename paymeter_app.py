@@ -1,4 +1,3 @@
-
 # paymeter_app.py
 # -*- coding: utf-8 -*-
 """
@@ -287,6 +286,7 @@ def merge_districts(paymeter_cleaned: str, district_path: str, out_path: str) ->
 # -----------------------------
 # Step C: Merge Eko & Analyze → ONE Excel
 # -----------------------------
+
 def merge_and_analyze(
     eko_path: str,
     trans_path: str,
@@ -299,35 +299,38 @@ def merge_and_analyze(
     eko   = safe_read_csv(Path(eko_path))
     trans = safe_read_csv(Path(trans_path))
 
-    eko_keep = ['Request ID', 'Transaction Date', 'Account Number', 'Total Amount']
-    trans_keep = ['Reference', 'Created At', 'Account Number', 'Transaction Amount']
+    # drop conflicting columns across sources defensively
+    eko = eko.drop(columns=[c for c in ['Reference','Created At','Account Number','Transaction Amount'] if c in eko.columns], errors='ignore')
+    trans = trans.drop(columns=[c for c in ['Request ID','Transaction Date','Account Number','Total Amount'] if c in trans.columns], errors='ignore')
 
-    eko = eko.drop(columns=[c for c in trans_keep if c in eko.columns], errors='ignore')
-    trans = trans.drop(columns=[c for c in eko_keep if c in trans.columns], errors='ignore')
-
-    if 'Request ID' in eko.columns:
-        eko['ref'] = eko['Request ID'].astype(str).str.strip()
-    else:
-        eko['ref'] = eko.index.astype(str)
-
-    if 'Reference' in trans.columns:
-        trans['ref'] = trans['Reference'].astype(str).str.strip()
-    else:
-        trans['ref'] = trans.index.astype(str)
+    # create refs
+    eko['ref']   = eko['Request ID'].astype(str).str.strip() if 'Request ID' in eko.columns else eko.index.astype(str)
+    trans['ref'] = trans['Reference'].astype(str).str.strip() if 'Reference' in trans.columns else trans.index.astype(str)
 
     eko['source'] = 'eko'
     trans['source'] = 'paymeter'
 
     merged = pd.merge(eko, trans, on='ref', how='outer', suffixes=('_eko', '_trans'))
 
-    src_col = None
-    for candidate in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT']:
-        if candidate in merged.columns and merged[candidate].notna().any():
-            src_col = candidate
-            break
+    # --- Parse/ensure a Created At column for monthly grouping ---
+    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt']
+    created_col = next((c for c in created_candidates if c in merged.columns), None)
+    txn_candidates_dates = ['Transaction Date', 'TransactionDate', 'transactiondate', 'Transaction Date_eko', 'transaction_date']
+    txn_date_col = next((c for c in txn_candidates_dates if c in merged.columns), None)
+
+    if created_col:
+        merged['Created At'] = pd.to_datetime(merged[created_col], errors='coerce')
+    elif txn_date_col:
+        merged['Created At'] = pd.to_datetime(merged[txn_date_col], errors='coerce')
+    else:
+        merged['Created At'] = pd.NaT
+
+    # --- District ---
+    src_col = next((c for c in ['District Name', 'DISTRICT BY ADDRESS', 'District', 'district', 'DISTRICT'] if c in merged.columns and merged[c].notna().any()), None)
     merged['District'] = merged[src_col].astype(str).replace({'nan': None}).fillna('empty').astype(str).str.strip() if src_col else 'empty'
 
-    def pick_amount(col_list: List[str]) -> Optional[str]:
+    # --- Amount detection (existing logic) ---
+    def pick_amount(col_list):
         for c in col_list:
             if c in merged.columns:
                 s = merged[c].astype(str).str.replace(r'[,\s₦$]', '', regex=True).str.strip()
@@ -335,207 +338,349 @@ def merge_and_analyze(
                     return c
         return None
 
-    txn_candidates = ['Transaction Amount_trans', 'Transaction Amount', 'Transaction Amount_eko', 'Txn Amount', 'txn amount', 'Amount', 'amount', 'amt']
-    total_candidates = ['Total Amount', 'Total Amount_eko', 'Total', 'total']
-    txn_col = pick_amount(txn_candidates)
-    total_col = pick_amount(total_candidates)
-
-    if txn_col:
-        merged['Transaction Amount'] = pd.to_numeric(merged[txn_col].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0.0)
-    else:
-        merged['Transaction Amount'] = 0.0
-
-    if total_col:
-        merged['Total Amount'] = pd.to_numeric(merged[total_col].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0.0)
-    else:
-        merged['Total Amount'] = 0.0
+    txn_col = pick_amount(['Transaction Amount_trans','Transaction Amount','Transaction Amount_eko','Txn Amount','txn amount','Amount','amount','amt'])
+    total_col = pick_amount(['Total Amount','Total Amount_eko','Total','total'])
+    merged['Transaction Amount'] = pd.to_numeric(merged[txn_col].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0.0) if txn_col else 0.0
+    merged['Total Amount'] = pd.to_numeric(merged[total_col].astype(str).str.replace(r'[,\s₦$]', '', regex=True), errors='coerce').fillna(0.0) if total_col else 0.0
 
     merged['fig_dif'] = merged['Total Amount'] - merged['Transaction Amount']
     merged['amt_less_vat'] = merged['Transaction Amount'] / 1.075
     merged['commission'] = merged['amt_less_vat'].apply(calculate_commission)
 
-    kcg_accounts = set()
-    if kcg_path and os.path.exists(kcg_path):
+    # --- Load KCG anchor (fallback to DEFAULT_KCG) ---
+    kcg_list = []
+    if (kcg_path and os.path.exists(kcg_path)) or (not kcg_path and DEFAULT_KCG.exists()):
+        actual = kcg_path if (kcg_path and os.path.exists(kcg_path)) else str(DEFAULT_KCG)
         try:
-            kcg_df = safe_read_csv(Path(kcg_path))
+            kcg_df = safe_read_csv(Path(actual))
             kcg_col = pick_kcg_column(kcg_df)
-            kcg_accounts = set(kcg_df[kcg_col].astype(str).apply(normalize_acct))
+            kcg_norm = kcg_df[kcg_col].astype(str).apply(normalize_acct).unique().tolist()
+            kcg_list = [x for x in kcg_norm if x and len(x) >= 1]
         except Exception:
-            pass
+            kcg_list = []
+    kcg_set = set(kcg_list)
 
-    possible_account_columns = []
+    # --- Find candidate account-like columns (permissive) ---
+    candidate_account_columns = []
     for c in merged.columns:
         lc = c.lower()
-        if 'account' in lc or 'acct' in lc or 'accountnumber' in lc.replace(' ', ''):
-            possible_account_columns.append(c)
+        if 'account' in lc or 'acct' in lc or 'accountnumber' in lc.replace(' ',''):
+            candidate_account_columns.append(c)
+        else:
+            # sample some values and if many contain digits consider it
+            try:
+                sample = merged[c].astype(str).head(100).str.replace(r'\D','',regex=True)
+                if sample.str.len().ge(4).mean() >= 0.3:
+                    candidate_account_columns.append(c)
+            except Exception:
+                pass
 
-    matched_any = pd.Series(False, index=merged.index)
-    for col in possible_account_columns:
+    if not candidate_account_columns:
+        merged['Account Number'] = merged.index.astype(str)
+        candidate_account_columns = ['Account Number']
+
+    # --- Build normalized tokens per row and attempt matching ---
+    debug_rows = []
+    matched_mask = pd.Series(False, index=merged.index)
+    matched_rule = pd.Series("", index=merged.index)
+    matched_kcg_value = pd.Series("", index=merged.index)
+
+    def try_match(norm_val: str):
+        if not norm_val:
+            return (None, None)
+        # exact
+        if norm_val in kcg_set:
+            return (norm_val, "exact")
+        # suffix/endswith
+        for k in kcg_list:
+            if k and (norm_val.endswith(k) or k.endswith(norm_val)):
+                return (k, "suffix")
+        # last6
+        x6 = norm_val[-6:] if len(norm_val) >= 6 else norm_val
+        for k in kcg_list:
+            if k and (k.endswith(x6) or x6.endswith(k[-6:])):
+                return (k, "last6")
+        # last4
+        x4 = norm_val[-4:] if len(norm_val) >= 4 else norm_val
+        for k in kcg_list:
+            if k and (k.endswith(x4) or x4.endswith(k[-4:])):
+                return (k, "last4")
+        # substring (permissive)
+        for k in kcg_list:
+            if k and (k in norm_val or norm_val in k):
+                return (k, "substring")
+        return (None, None)
+
+    # iterate candidate columns and populate debug and match attempts (use .items())
+    for col in candidate_account_columns:
         try:
             norm_series = merged[col].astype(str).apply(normalize_acct)
-            merged[f"{col}_norm"] = norm_series
-            if kcg_accounts:
-                matched = norm_series.isin(kcg_accounts)
-                matched_any = matched_any | matched
         except Exception:
-            continue
+            norm_series = merged[col].astype(str).apply(normalize_acct) if col in merged.columns else pd.Series([""]*len(merged), index=merged.index)
 
+        merged[f"{col}_norm"] = norm_series
+        merged[f"{col}_last6"] = norm_series.apply(lambda s: s[-6:] if s and len(s) >= 6 else s)
+        merged[f"{col}_last4"] = norm_series.apply(lambda s: s[-4:] if s and len(s) >= 4 else s)
+
+        for idx, nv in norm_series.items():
+            matched_val, rule = try_match(nv)
+            debug_rows.append({
+                "index": idx,
+                "source_col": col,
+                "raw_value": merged.at[idx, col] if col in merged.columns else "",
+                "norm_value": nv,
+                "last6": merged.at[idx, f"{col}_last6"],
+                "last4": merged.at[idx, f"{col}_last4"],
+                "matched_kcg": matched_val or "",
+                "match_rule": rule or ""
+            })
+            if matched_val:
+                matched_mask.at[idx] = True
+                if not matched_rule.at[idx]:
+                    matched_rule.at[idx] = rule or ""
+                    matched_kcg_value.at[idx] = matched_val
+
+    # textual flags
     text_flag = pd.Series(False, index=merged.index)
-    for flag_col in ("Disco Commission Type", "DiscoCommissionType", "Commission Type", "CommissionType", "Remarks", "Note"):
+    for flag_col in ("Disco Commission Type","DiscoCommissionType","Commission Type","CommissionType","Remarks","Note"):
         if flag_col in merged.columns:
             try:
                 text_flag = text_flag | merged[flag_col].fillna('').astype(str).str.contains('kcg', case=False, na=False)
             except Exception:
                 pass
 
-    merged['Is_KCG'] = (matched_any | text_flag).fillna(False)
+    merged['Is_KCG'] = (matched_mask | text_flag).fillna(False)
+    merged['KCG_Matched_Value'] = matched_kcg_value
+    merged['KCG_Match_Rule'] = matched_rule
 
+    # split
     kcg_rows = merged.loc[merged['Is_KCG']].copy()
     non_kcg_rows = merged.loc[~merged['Is_KCG']].copy()
 
+    # try to fill missing dates
+    def fill_missing_dates(df):
+        if df is None or df.empty:
+            return df
+        missing = df['Created At'].isna()
+        if not missing.any():
+            return df
+        date_cols = [c for c in df.columns if 'transaction date' in c.lower() or 'transactiondate' in c.lower() or 'created' in c.lower()]
+        for dc in date_cols:
+            try:
+                cand = pd.to_datetime(df[dc], errors='coerce')
+                if cand.notna().any():
+                    df.loc[missing, 'Created At'] = cand.loc[missing]
+                    break
+            except Exception:
+                continue
+        return df
+
+    kcg_rows = fill_missing_dates(kcg_rows)
+    non_kcg_rows = fill_missing_dates(non_kcg_rows)
+
+    # --- Summaries & ranges ---
     main_summary = pd.DataFrame([
-        {"Category": "All Accounts", "Count": len(merged),
-         "Transaction Amount": merged['Transaction Amount'].sum(),
-         "Commission": merged['commission'].sum()},
-        {"Category": "KCG Accounts", "Count": len(kcg_rows),
-         "Transaction Amount": kcg_rows['Transaction Amount'].sum(),
-         "Commission": kcg_rows['commission'].sum()},
-        {"Category": "Non-KCG Accounts", "Count": len(non_kcg_rows),
-         "Transaction Amount": non_kcg_rows['Transaction Amount'].sum(),
-         "Commission": non_kcg_rows['commission'].sum()}
+        {"Category":"All Accounts","Count":len(merged),"Transaction Amount":merged['Transaction Amount'].sum(),"Commission":merged['commission'].sum()},
+        {"Category":"KCG Accounts","Count":len(kcg_rows),"Transaction Amount":kcg_rows['Transaction Amount'].sum(),"Commission":kcg_rows['commission'].sum()},
+        {"Category":"Non-KCG Accounts","Count":len(non_kcg_rows),"Transaction Amount":non_kcg_rows['Transaction Amount'].sum(),"Commission":non_kcg_rows['commission'].sum()}
     ])
 
-    bins = [0, 10000, 20000, 40000, 60000, 80000, 100000, 200000, 300000, 500000, 1000000, float("inf")]
-    labels = [
-        "0 - 10,000", "10,001 - 20,000", "20,001 - 40,000", "40,001 - 60,000",
-        "60,001 - 80,000", "80,001 - 100,000", "100,001 - 200,000",
-        "200,001 - 300,000", "300,001 - 500,000", "500,001 - 1,000,000",
-        "1,000,001 and above"
-    ]
+    bins = [0,10000,20000,40000,60000,80000,100000,200000,300000,500000,1000000,float("inf")]
+    labels = ["0 - 10,000","10,001 - 20,000","20,001 - 40,000","40,001 - 60,000","60,001 - 80,000","80,001 - 100,000","100,001 - 200,000","200,001 - 300,000","300,001 - 500,000","500,001 - 1,000,000","1,000,001 and above"]
     if not non_kcg_rows.empty:
-        non_kcg_rows = non_kcg_rows.assign(Amount_Range=pd.cut(non_kcg_rows['Transaction Amount'], bins=bins, labels=labels, right=True))
-        non_kcg_ranges = non_kcg_rows.groupby('Amount_Range', observed=False).agg(
-            Transaction_Count=('Transaction Amount', 'size'),
-            Total_Amount=('Transaction Amount', 'sum'),
-            Total_Commission=('commission', 'sum')
-        ).reset_index()
+        non_kcg_rows = non_kcg_rows.assign(Amount_Range = pd.cut(non_kcg_rows['Transaction Amount'], bins=bins, labels=labels, right=True))
+        non_kcg_ranges = non_kcg_rows.groupby('Amount_Range', observed=False).agg(Transaction_Count=('Transaction Amount','size'), Total_Amount=('Transaction Amount','sum'), Total_Commission=('commission','sum')).reset_index()
     else:
         non_kcg_ranges = pd.DataFrame(columns=['Amount_Range','Transaction_Count','Total_Amount','Total_Commission'])
 
+    # account summary
     account_col_candidates = [c for c in merged.columns if 'account' in c.lower()]
     acct_col = account_col_candidates[0] if account_col_candidates else 'Account Number_trans'
     if acct_col not in merged.columns:
         merged[acct_col] = merged.get('Account Number_trans', merged.index.astype(str))
     merged[acct_col] = merged[acct_col].astype(str).apply(normalize_acct)
-
-    cust_col = None
-    for c in ['Customer Name', 'CustomerName', 'Name', 'Customer']:
-        if c in merged.columns:
-            cust_col = c
-            break
+    cust_col = next((c for c in ['Customer Name','CustomerName','Name','Customer'] if c in merged.columns), None)
     if cust_col is None:
-        merged['Customer Name'] = merged.get('Customer Name', '')
+        merged['Customer Name'] = merged.get('Customer Name','')
         cust_col = 'Customer Name'
+    account_summary = merged.groupby([acct_col,cust_col], as_index=False).agg(Transaction_Count=('Transaction Amount','size'), Total_Amount=('Transaction Amount','sum'), Total_Commission=('commission','sum'))
+    top20 = account_summary.sort_values(by=['Transaction_Count','Total_Amount'], ascending=[False,False]).head(20)
+    scenario_no_kcg = pd.DataFrame([{"Category":"Scenario: Non-KCG Only","Count":len(non_kcg_rows),"Transaction Amount":non_kcg_rows['Transaction Amount'].sum(),"Commission":non_kcg_rows['commission'].sum()}])
 
-    account_summary = merged.groupby([acct_col, cust_col], as_index=False).agg(
-        Transaction_Count=('Transaction Amount','size'),
-        Total_Amount=('Transaction Amount','sum'),
-        Total_Commission=('commission','sum')
-    )
+    # --- Monthly aggregates; ensure 'Unknown' included when Created At missing ---
+    def produce_month_col(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=['Month','Count','Transaction_Amount','Commission'])
+        df_local = df.copy()
+        df_local['Month'] = pd.to_datetime(df_local['Created At'], errors='coerce').dt.to_period('M')
+        no_date = df_local['Month'].isna()
+        if no_date.any():
+            df_local.loc[no_date,'Month'] = 'Unknown'
+        df_local['Month'] = df_local['Month'].astype(str)
+        grouped = df_local.groupby('Month', observed=False).agg(Count=('Transaction Amount','size'), Transaction_Amount=('Transaction Amount','sum'), Commission=('commission','sum')).reset_index()
+        return grouped
 
-    top20 = account_summary.sort_values(by=['Transaction_Count','Total_Amount'], ascending=[False, False]).head(20)
+    monthly_non_kcg = produce_month_col(non_kcg_rows)
+    monthly_kcg = produce_month_col(kcg_rows)
+    monthly_all = produce_month_col(merged)
 
-    scenario_no_kcg = pd.DataFrame([{
-        "Category": "Scenario: Non-KCG Only",
-        "Count": len(non_kcg_rows),
-        "Transaction Amount": non_kcg_rows['Transaction Amount'].sum(),
-        "Commission": non_kcg_rows['commission'].sum()
-    }])
+    # combine monthly trends
+    def rename_cols(df,prefix):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=['Month', f'{prefix}_Count', f'{prefix}_Transaction_Amount', f'{prefix}_Commission'])
+        return df.rename(columns={'Count':f'{prefix}_Count','Transaction_Amount':f'{prefix}_Transaction_Amount','Commission':f'{prefix}_Commission'})
 
-    created_candidates = ['Created At', 'Created_At', 'createdat', 'created_at', 'CreatedAt']
-    created_col = None
-    for c in created_candidates:
-        if c in merged.columns:
-            created_col = c
-            break
-    if created_col:
-        merged['Created At'] = pd.to_datetime(merged[created_col], errors='coerce')
-        kcg_rows['Created At'] = pd.to_datetime(kcg_rows.get(created_col, kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
-        non_kcg_rows['Created At'] = pd.to_datetime(non_kcg_rows.get(created_col, non_kcg_rows.get('Created At', pd.Series(dtype=str))), errors='coerce')
-    else:
-        merged['Created At'] = pd.NaT
-        kcg_rows['Created At'] = pd.NaT
-        non_kcg_rows['Created At'] = pd.NaT
+    ma = rename_cols(monthly_all,'All')
+    mk = rename_cols(monthly_kcg,'KCG')
+    mn = rename_cols(monthly_non_kcg,'NonKCG')
+    monthly_trends_combined = pd.merge(ma,mk,on='Month',how='outer').merge(mn,on='Month',how='outer').fillna(0)
 
-    monthly_non_kcg = non_kcg_rows.assign(Month=non_kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
-        Count=('Transaction Amount','size'),
-        Transaction_Amount=('Transaction Amount','sum'),
-        Commission=('commission','sum')
-    ).reset_index()
-    monthly_kcg = kcg_rows.assign(Month=kcg_rows['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
-        Count=('Transaction Amount','size'),
-        Transaction_Amount=('Transaction Amount','sum'),
-        Commission=('commission','sum')
-    ).reset_index()
-    monthly_all = merged.assign(Month=merged['Created At'].dt.to_period('M')).groupby('Month', observed=False).agg(
-        All_Count=('Transaction Amount','size'),
-        All_Transaction_Amount=('Transaction Amount','sum'),
-        All_Commission=('commission','sum')
-    ).reset_index()
-
-    monthly_trends_combined = monthly_all.copy()
-    if not monthly_trends_combined.empty:
-        monthly_trends_combined = monthly_trends_combined.merge(monthly_kcg, on='Month', how='outer', suffixes=('', '_KCG'))
-        monthly_trends_combined = monthly_trends_combined.merge(monthly_non_kcg, on='Month', how='outer', suffixes=('', '_NonKCG')).fillna(0)
-    else:
-        monthly_trends_combined = pd.DataFrame(columns=[
-            'Month', 'All_Count', 'All_Transaction_Amount', 'All_Commission',
-            'Count', 'Transaction_Amount', 'Commission'
-        ])
-
-    def build_projection(monthly_df):
-        proj = pd.DataFrame()
-        if monthly_df is not None and not monthly_df.empty:
-            window = min(3, len(monthly_df))
-            recent = monthly_df.tail(window)
-            last_month = monthly_df['Month'].iloc[-1]
-            try:
-                next_month = str(last_month + 1)
-            except Exception:
-                next_month = "proj"
-            proj = pd.DataFrame([{
-                "Month": next_month,
-                "Projected_Count": round(recent['Count'].mean(), 0) if 'Count' in recent.columns else 0,
-                "Projected_Amount": round(recent['Transaction_Amount'].mean(), 2) if 'Transaction_Amount' in recent.columns else 0.0,
-                "Projected_Commission": round(recent['Commission'].mean(), 2) if 'Commission' in recent.columns else 0.0,
-                "Basis": f"Average of last {window} month(s)"
-            }])
-        return proj
-
-    projection_non_kcg = build_projection(monthly_non_kcg)
-    projection_kcg = build_projection(monthly_kcg)
-
+    # --- District summary with KCG breakdowns ---
     report = pd.DataFrame(merged['District'].unique(), columns=['District'])
-    district_trans_totals = merged.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount': 'paymeter_total'})
-    district_eko_totals = merged.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount': 'eko_total'})
-    district_commission = merged.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission': 'district_commission'})
+    district_trans_totals = merged.groupby('District', dropna=False)['Transaction Amount'].sum().reset_index().rename(columns={'Transaction Amount':'paymeter_total'})
+    district_eko_totals = merged.groupby('District', dropna=False)['Total Amount'].sum().reset_index().rename(columns={'Total Amount':'eko_total'})
+    district_commission = merged.groupby('District', dropna=False)['commission'].sum().reset_index().rename(columns={'commission':'district_commission'})
+
+    district_kcg_counts = merged.loc[merged['Is_KCG']].groupby('District', dropna=False).size().reset_index(name='kcg_count')
+    district_kcg_pay = merged.loc[merged['Is_KCG']].groupby('District', dropna=False)['Transaction Amount'].sum().reset_index(name='kcg_paymeter_total')
+    district_kcg_eko = merged.loc[merged['Is_KCG']].groupby('District', dropna=False)['Total Amount'].sum().reset_index(name='kcg_eko_total')
+    district_kcg_comm = merged.loc[merged['Is_KCG']].groupby('District', dropna=False)['commission'].sum().reset_index(name='kcg_commission')
+
+    district_non_kcg_counts = merged.loc[~merged['Is_KCG']].groupby('District', dropna=False).size().reset_index(name='nonkcg_count')
+    district_non_kcg_pay = merged.loc[~merged['Is_KCG']].groupby('District', dropna=False)['Transaction Amount'].sum().reset_index(name='nonkcg_paymeter_total')
+    district_non_kcg_eko = merged.loc[~merged['Is_KCG']].groupby('District', dropna=False)['Total Amount'].sum().reset_index(name='nonkcg_eko_total')
+    district_non_kcg_comm = merged.loc[~merged['Is_KCG']].groupby('District', dropna=False)['commission'].sum().reset_index(name='nonkcg_commission')
+
     report = report.merge(district_trans_totals, on='District', how='left')\
                    .merge(district_eko_totals, on='District', how='left')\
-                   .merge(district_commission, on='District', how='left')
-    for c in ['paymeter_total','eko_total','district_commission']:
-        if c in report.columns:
-            report[c] = report[c].fillna(0.0)
-    report['difference'] = report['eko_total'] - report['paymeter_total']
+                   .merge(district_commission, on='District', how='left')\
+                   .merge(district_kcg_counts, on='District', how='left')\
+                   .merge(district_kcg_pay, on='District', how='left')\
+                   .merge(district_kcg_eko, on='District', how='left')\
+                   .merge(district_kcg_comm, on='District', how='left')\
+                   .merge(district_non_kcg_counts, on='District', how='left')\
+                   .merge(district_non_kcg_pay, on='District', how='left')\
+                   .merge(district_non_kcg_eko, on='District', how='left')\
+                   .merge(district_non_kcg_comm, on='District', how='left')
 
+    num_cols = ['paymeter_total','eko_total','district_commission','kcg_count','kcg_paymeter_total','kcg_eko_total','kcg_commission','nonkcg_count','nonkcg_paymeter_total','nonkcg_eko_total','nonkcg_commission']
+    for c in num_cols:
+        if c in report.columns:
+            report[c] = pd.to_numeric(report[c], errors='coerce').fillna(0)
+
+    report['difference'] = report['eko_total'] - report['paymeter_total']
+    report['kcg_share_pct'] = report.apply(lambda r: (r['kcg_paymeter_total']/r['paymeter_total']*100.0) if r['paymeter_total'] else 0.0, axis=1)
+
+    # --- Build DistrictSummaryTotal: include bank details from district_info if present ---
+    # Prepare default empty bank columns
+    district_summary_total = report[['District','paymeter_total','eko_total','district_commission','difference']].copy()
+    district_summary_total['Bank name'] = ""
+    district_summary_total['Bank acct name'] = ""
+    district_summary_total['Bank acct number'] = ""
+
+    # Try to load district_info (either provided path or DEFAULT)
+    district_info_df = None
     if district_info_path and os.path.exists(district_info_path):
         try:
-            district_info = safe_read_csv(Path(district_info_path))
-            if 'district' in district_info.columns:
-                district_info = district_info.rename(columns={'district': 'District'})
-            report = report.merge(district_info, on='District', how='left')
+            district_info_df = safe_read_csv(Path(district_info_path))
         except Exception:
-            pass
+            district_info_df = None
+    elif DEFAULT_DISTRICT_INFO.exists():
+        try:
+            district_info_df = safe_read_csv(DEFAULT_DISTRICT_INFO)
+        except Exception:
+            district_info_df = None
 
+    if district_info_df is not None and not district_info_df.empty:
+        # normalize district column name
+        district_col = None
+        for c in district_info_df.columns:
+            if c.lower() in ('district','districtname','district_name','area'):
+                district_col = c
+                break
+        if not district_col:
+            # try find a column whose values match districts
+            for c in district_info_df.columns:
+                sample = district_info_df[c].astype(str).head(50)
+                if sample.str.strip().str.len().gt(0).any():
+                    # no strong guarantee — just pick the first non-empty column as district fallback
+                    district_col = c
+                    break
+
+        # detect bank columns heuristically
+        bank_name_col = None
+        bank_acct_name_col = None
+        bank_acct_num_col = None
+        for c in district_info_df.columns:
+            lc = c.lower().replace(' ','').replace('_','')
+            if bank_name_col is None and any(k in lc for k in ('bankname','bank','bankname2','bankbranch')):
+                bank_name_col = c
+            if bank_acct_name_col is None and any(k in lc for k in ('accountname','acctname','beneficiary','beneficiaryname','accountname1','acctname1')):
+                bank_acct_name_col = c
+            if bank_acct_num_col is None and any(k in lc for k in ('accountnumber','acctnumber','acctno','accountno','account_number','acctnum')):
+                bank_acct_num_col = c
+
+        # normalize/rename to join
+        join_df = district_info_df.copy()
+        # ensure district_col exists
+        if district_col is None:
+            # nothing sensible to join on; attempt best-effort: if there's a column named 'district' in report, skip join
+            district_col = None
+        else:
+            join_df = join_df[[c for c in [district_col, bank_name_col, bank_acct_name_col, bank_acct_num_col] if c in join_df.columns]]
+            join_df = join_df.rename(columns={
+                district_col: 'District',
+                bank_name_col or '': 'Bank name' if bank_name_col else bank_name_col,
+                bank_acct_name_col or '': 'Bank acct name' if bank_acct_name_col else bank_acct_name_col,
+                bank_acct_num_col or '': 'Bank acct number' if bank_acct_num_col else bank_acct_num_col
+            })
+            # Clean columns: keep only those present
+            cols_to_keep = [c for c in ['District','Bank name','Bank acct name','Bank acct number'] if c in join_df.columns]
+            join_df = join_df[cols_to_keep]
+            # Normalize District values
+            join_df['District'] = join_df['District'].astype(str).str.strip()
+
+            # Merge into district_summary_total on District
+            district_summary_total = district_summary_total.merge(join_df, on='District', how='left')
+            # If merge left duplicates existing columns, ensure final column names exist
+            for col in ['Bank name','Bank acct name','Bank acct number']:
+                if col not in district_summary_total.columns:
+                    district_summary_total[col] = ""
+            # Fill NaNs with empty strings
+            for col in ['Bank name','Bank acct name','Bank acct number']:
+                district_summary_total[col] = district_summary_total[col].fillna("")
+
+    # Ensure numeric and ordering
+    for c in ['paymeter_total','eko_total','district_commission','difference']:
+        if c in district_summary_total.columns:
+            district_summary_total[c] = pd.to_numeric(district_summary_total[c], errors='coerce').fillna(0.0)
+
+    # Reorder columns exactly as requested
+    desired_order = ['District','paymeter_total','eko_total','district_commission','difference','Bank name','Bank acct name','Bank acct number']
+    for col in desired_order:
+        if col not in district_summary_total.columns:
+            # create missing columns as blank
+            district_summary_total[col] = "" if col.startswith('Bank') else 0.0
+    district_summary_total = district_summary_total[desired_order]
+
+    # --- Build debug frames that will reveal why/what matched ---
+    debug_df = pd.DataFrame(debug_rows)
+    if debug_df.empty:
+        debug_df = pd.DataFrame(columns=['index','source_col','raw_value','norm_value','last6','last4','matched_kcg','match_rule'])
+    else:
+        ctx_cols = [c for c in ['District','Transaction Amount','Total Amount','Created At','Is_KCG','KCG_Matched_Value','KCG_Match_Rule'] if c in merged.columns]
+        ctx = merged[ctx_cols].reset_index().rename(columns={'index':'index'})
+        debug_df = debug_df.merge(ctx, on='index', how='left')
+
+    # KCG summary
+    kcg_summary = pd.DataFrame([{
+        "KCG_anchor_count": len(kcg_list),
+        "Matched_rows_count": int(kcg_rows.shape[0]),
+        "Matched_transaction_amount_total": float(kcg_rows['Transaction Amount'].sum()) if not kcg_rows.empty else 0.0,
+        "Matched_commission_total": float(kcg_rows['commission'].sum()) if not kcg_rows.empty else 0.0
+    }])
+
+    # audit empty district rows
     audit_df = pd.DataFrame()
     try:
         empty_rows = merged[merged['District'].astype(str).str.lower() == 'empty']
@@ -547,6 +692,7 @@ def merge_and_analyze(
     except Exception:
         pass
 
+    # make columns unique before writing
     merged = make_columns_unique(merged)
     report = make_columns_unique(report)
     account_summary = make_columns_unique(account_summary)
@@ -557,9 +703,10 @@ def merge_and_analyze(
     monthly_non_kcg = make_columns_unique(monthly_non_kcg)
     monthly_kcg = make_columns_unique(monthly_kcg)
     monthly_trends_combined = make_columns_unique(monthly_trends_combined)
-    projection_non_kcg = make_columns_unique(projection_non_kcg)
-    projection_kcg = make_columns_unique(projection_kcg)
     audit_df = make_columns_unique(audit_df)
+    debug_df = make_columns_unique(debug_df)
+    kcg_summary = make_columns_unique(kcg_summary)
+    district_summary_total = make_columns_unique(district_summary_total)
 
     try:
         with pd.ExcelWriter(out_excel, engine="openpyxl") as writer:
@@ -571,9 +718,12 @@ def merge_and_analyze(
             monthly_non_kcg.to_excel(writer, sheet_name="Monthly Non-KCG", index=False)
             monthly_kcg.to_excel(writer, sheet_name="Monthly KCG", index=False)
             monthly_trends_combined.to_excel(writer, sheet_name="Monthly Trends (All)", index=False)
-            projection_non_kcg.to_excel(writer, sheet_name="Projection Non-KCG", index=False)
-            projection_kcg.to_excel(writer, sheet_name="Projection KCG", index=False)
             report.to_excel(writer, sheet_name="District Summary", index=False)
+            # new sheet
+            district_summary_total.to_excel(writer, sheet_name="DistrictSummaryTotal", index=False)
+            kcg_summary.to_excel(writer, sheet_name="KCG_Summary", index=False)
+            if not debug_df.empty:
+                debug_df.to_excel(writer, sheet_name="KCG_Debug", index=False)
             if not audit_df.empty:
                 audit_df.to_excel(writer, sheet_name="Audit Empty District", index=False)
             merged.to_csv(out_detail, index=False)
@@ -585,9 +735,14 @@ def merge_and_analyze(
         "monthly_trends_combined": monthly_trends_combined,
         "top20": top20,
         "out_detail": out_detail,
-        "out_excel": out_excel
+        "out_excel": out_excel,
+        "kcg_anchor_count": len(kcg_list),
+        "kcg_matched_rows": int(kcg_rows.shape[0]),
+        "kcg_matched_amount": float(kcg_rows['Transaction Amount'].sum()) if not kcg_rows.empty else 0.0
     })
     return result
+
+
 
 # =============================================
 # MODERN & FANCY STREAMLIT UI
